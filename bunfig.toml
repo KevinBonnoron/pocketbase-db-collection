@@ -1,0 +1,10 @@
+# Bun configuration for pocketbase-db-collection
+
+[install]
+# Automatic dependency installation
+auto = true
+
+[test]
+# Test configuration
+coverage = true
+

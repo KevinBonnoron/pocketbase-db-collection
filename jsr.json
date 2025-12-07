@@ -1,0 +1,21 @@
+{
+  "name": "@kevinbonnoron/pocketbase-db-collection",
+  "version": "0.0.1",
+  "license": "MIT",
+  "exports": "./src/index.ts",
+  "publish": {
+    "exclude": [
+      ".devcontainer",
+      ".github",
+      ".vscode",
+      "dist",
+      "node_modules",
+      "tests",
+      "*.config.*",
+      "*.md",
+      "CLAUDE.md",
+      "lefthook.yml",
+      "bun.lockb"
+    ]
+  }
+}

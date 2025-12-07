@@ -1,0 +1,9 @@
+{
+  "name": "Pocketbase db collection",
+  "image": "ghcr.io/nhaef/devcontainer-bun:latest",
+  "customizations": {
+    "vscode": {
+      "extensions": ["biomejs.biome"]
+    }
+  }
+}
