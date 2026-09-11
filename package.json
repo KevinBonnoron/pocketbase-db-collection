@@ -1,6 +1,6 @@
 {
   "name": "pocketbase-db-collection",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pocketbase collection adapter for TanStack DB",
   "type": "module",
   "main": "dist/cjs/index.cjs",
