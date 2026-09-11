@@ -24,9 +24,9 @@
     "src"
   ],
   "scripts": {
-    "build": "rm -rf dist && mkdir -p dist/esm dist/cjs && bun build src/index.ts --outdir dist/esm --format esm --target browser --minify --sourcemap --bundle && bun build src/index.ts --outdir dist/cjs --format cjs --target node --minify --sourcemap --bundle && bunx tsc --project tsconfig.build.json && bun -e \"import {readdirSync,copyFileSync} from 'fs';readdirSync('dist/esm').filter(f=>f.endsWith('.d.ts')).forEach(f=>copyFileSync('dist/esm/'+f,'dist/cjs/'+f.replace('.d.ts','.d.cts')))\"",
+    "build": "rm -rf dist && mkdir -p dist/esm dist/cjs && bun build src/index.ts --outdir dist/esm --format esm --target browser --minify --sourcemap --bundle && bun build src/index.ts --outdir dist/cjs --format cjs --target node --entry-naming '[dir]/[name].cjs' --minify --sourcemap --bundle && bunx tsc --project tsconfig.build.json && bun -e \"import {readdirSync,copyFileSync} from 'fs';readdirSync('dist/esm').filter(f=>f.endsWith('.d.ts')).forEach(f=>copyFileSync('dist/esm/'+f,'dist/cjs/'+f.replace('.d.ts','.d.cts')))\"",
     "build:esm": "bun build src/index.ts --outdir dist/esm --format esm --target browser --minify --sourcemap --bundle",
-    "build:cjs": "bun build src/index.ts --outdir dist/cjs --format cjs --target node --minify --sourcemap --bundle",
+    "build:cjs": "bun build src/index.ts --outdir dist/cjs --format cjs --target node --entry-naming '[dir]/[name].cjs' --minify --sourcemap --bundle",
     "build:types": "bunx tsc --project tsconfig.build.json",
     "dev": "bun build src/index.ts --outdir dist/esm --format esm --target browser --watch",
     "test": "bun test",
