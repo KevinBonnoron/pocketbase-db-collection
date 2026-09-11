@@ -7,12 +7,12 @@ type PocketbaseRecord = Omit<RecordModel, `collectionId` | `collectionName`> & {
   id: string;
 };
 
-export interface PocketbaseCollectionUtils {
+export type PocketbaseCollectionUtils = {
   /** Generates a PocketBase-compatible record id (15 lowercase alphanumeric characters). Use it as the `id` of inserted records so the optimistic row and the server row share the same key. */
   newId: () => string;
   /** Re-runs the initial fetch and replaces the synced state with the server state. TanStack DB shares `utils` between every collection created from the same options, so all of them are refetched. */
   refetch: () => Promise<void>;
-}
+};
 
 const ID_ALPHABET = `abcdefghijklmnopqrstuvwxyz0123456789`;
 const ID_LENGTH = 15;

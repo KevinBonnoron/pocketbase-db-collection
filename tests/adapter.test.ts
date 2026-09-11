@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from 'bun:test';
-import { createCollection } from '@tanstack/db';
+import { createCollection, createLiveQueryCollection, eq } from '@tanstack/db';
 import type { RecordService, RecordSubscription } from 'pocketbase';
 import { buildSubsetRequest, compileSort, compileWhere, pocketbaseCollectionOptions, UnsupportedFilterError } from '../src';
 
@@ -532,5 +532,17 @@ describe(`loadSubset requests`, () => {
     await tick();
     expect(svc.subscribe).toHaveBeenCalledTimes(1);
     expect(svc.handlers).toHaveLength(0);
+  });
+});
+
+describe('live queries', () => {
+  it('accepts a collection created from the adapter as a query source', async () => {
+    const service = new FakeRecordService();
+    service.records.set('a1', { id: 'a1', data: 'open' });
+    service.records.set('a2', { id: 'a2', data: 'closed' });
+    const rows = createCollection(pocketbaseCollectionOptions<Row>({ recordService: service as unknown as RecordService<Row> }));
+    const openRows = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, 'open')));
+    await openRows.preload();
+    expect(openRows.toArray.map(({ id }) => id)).toEqual(['a1']);
   });
 });
