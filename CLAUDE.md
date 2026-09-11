@@ -11,7 +11,9 @@ This is a TypeScript library that provides a PocketBase adapter for TanStack DB.
 - **Adapter Pattern**: The library implements TanStack DB's `CollectionConfig` interface to bridge PocketBase's RecordService API with TanStack DB's collection model
 - **Real-time Sync**: Uses PocketBase's subscribe mechanism to listen for server changes and synchronize them to the local TanStack DB collection
 - **Sync Flow**: Listens first (via `recordService.subscribe`), then fetches initial data (via `getFullList`), ensuring no events are missed during initial load
-- **Mutation Handlers**: Implements `onInsert`, `onUpdate`, and `onDelete` to propagate local changes back to PocketBase server
+- **Mutation Handlers**: Implements `onInsert`, `onUpdate`, and `onDelete` to propagate local changes back to PocketBase server, then write the server response into the synced state on the next macrotask (TanStack DB only drops a direct transaction's optimistic row when a sync change for its key lands after the transaction completed)
+- **Realtime upserts**: the adapter tracks synced keys itself; realtime `create`/`update` become `update` for known keys and `delete` of unknown keys is ignored
+- **On-demand mode**: `src/filter.ts` compiles live-query `where`/`orderBy`/`limit` into PocketBase `filter`/`sort`/`perPage`; untranslatable expressions fall back to the base filter
 
 ## Development Commands
 
@@ -62,9 +64,11 @@ Formats code using Biome. Configuration in `biome.json` enforces:
   - Implements sync protocol with `begin()`, `write()`, `commit()`, `markReady()` lifecycle
   - Handles create/update/delete mutations via PocketBase API
 
+- **`src/filter.ts`**: Expression to PocketBase filter compiler used by `loadSubset`
+
 - **`src/index.ts`**: Public API exports
 
-- **`tests/pocketbase.test.ts`**: Test suite with MockRecordService that simulates PocketBase behavior
+- **`tests/pocketbase.test.ts`**, **`tests/adapter.test.ts`**: Test suites with fake record services that simulate PocketBase behavior (realtime echoes, failures, on-demand)
 
 ## Type System Notes
 
