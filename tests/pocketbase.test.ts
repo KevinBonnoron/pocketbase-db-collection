@@ -225,6 +225,7 @@ describe(`PocketBase Integration`, () => {
     const insertTx = collection.insert(data);
     expect(recordService.create).toHaveBeenCalledTimes(1);
     expect(recordService.create).toHaveBeenCalledWith({
+      id: data.id,
       data: data.data,
       updated: data.updated,
     });
@@ -347,6 +348,7 @@ describe(`PocketBase Integration`, () => {
     expect(recordService.getFullList).toHaveBeenCalledTimes(1);
     expect(recordService.getFullList).toHaveBeenCalledWith({
       expand: 'artists,album,genres',
+      requestKey: null,
     });
   });
 });

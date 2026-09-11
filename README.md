@@ -4,32 +4,27 @@ A [PocketBase](https://pocketbase.io) collection adapter for [TanStack DB](https
 
 ## Features
 
-- Real-time sync via PocketBase's `subscribe()` mechanism
-- Initial data fetch with `getFullList()` after subscribing (no missed events)
-- Optimistic mutations forwarded to PocketBase (`create`, `update`, `delete`)
-- Optional `StandardSchema` integration for typed records
-- Automatic unsubscribe on collection cleanup
+- Real-time sync via PocketBase's `subscribe()`; realtime events are applied as upserts, so echoes of your own writes never raise duplicate-key errors
+- Initial data fetch with `getFullList()` after subscribing (no missed events), or query-driven loading with `syncMode: 'on-demand'`
+- Optimistic mutations forwarded to PocketBase (`create`, `update`, `delete`); the server response is written back into the synced state right after the mutation settles, so rows never flicker while waiting for the realtime echo
+- Client-generated ids (`collection.utils.newId()`) so the optimistic row and the server row share the same key
+- Optional `transform` to shape every record coming from PocketBase (dates, computed fields)
+- Optional Standard Schema for typed and validated mutations
+- Sync failures (expired token, network) surface through the collection error state
+- Automatic unsubscribe on collection cleanup, `collection.utils.refetch()` to resync from the server
 
 ## Installation
 
 ```bash
-npm install pocketbase-db-collection
+npm install pocketbase-db-collection @tanstack/db pocketbase
 # or
-bun add pocketbase-db-collection
-# or
-pnpm add pocketbase-db-collection
-```
-
-You also need to install the peer dependencies if they are not already in your project:
-
-```bash
-npm install @tanstack/db pocketbase
+bun add pocketbase-db-collection @tanstack/db pocketbase
 ```
 
 ## Peer dependencies
 
-- `@tanstack/db` `>=0.6.0`
-- `pocketbase` `>=0.26.0`
+- `@tanstack/db` `>=0.6.0 <1` (tested against 0.9)
+- `pocketbase` `>=0.26.0 <1` (tested against 0.28)
 
 ## Usage
 
@@ -61,17 +56,19 @@ await todos.stateWhenReady()
 const all = todos.toArray
 const one = todos.get('record-id')
 
-// Mutate — propagated to PocketBase, then synced back through the subscription
-todos.insert({ id: '', title: 'Buy milk', done: false })
+// Mutate: generate the id on the client so the optimistic row keeps its key
+todos.insert({ id: todos.utils.newId(), title: 'Buy milk', done: false })
 todos.update('record-id', (draft) => {
   draft.done = true
 })
 todos.delete('record-id')
 ```
 
+PocketBase accepts client-provided ids (15 lowercase alphanumeric characters), which is exactly what `newId()` produces. Inserting without an id still works, but TanStack DB then keeps a temporary optimistic row next to the server row until the next sync change, so always pass one.
+
 ### Passing PocketBase options
 
-The `options` field is forwarded to both `getFullList()` and `subscribe()`. Use it for filters, expand, fields, etc.
+The `options` field is forwarded to `getFullList()`, `getList()` and `subscribe()`. Use it for filters, expand, fields, sort.
 
 ```typescript
 const todos = createCollection(
@@ -86,9 +83,50 @@ const todos = createCollection(
 )
 ```
 
+### Transforming records
+
+`transform` runs on every record coming from PocketBase: initial fetch, realtime events and mutation responses. Use it to parse dates or derive fields.
+
+```typescript
+const appointments = createCollection(
+  pocketbaseCollectionOptions({
+    recordService: pb.collection('appointments'),
+    transform: (record) => ({ ...record, datetime: new Date(record.datetime) }),
+  }),
+)
+```
+
+### On-demand loading
+
+With `syncMode: 'on-demand'` the collection subscribes to realtime events but does not fetch everything up front. Live queries drive the loading: their `where`, `orderBy` and `limit` clauses are compiled into a PocketBase filter, sort and page size, combined with the base `options.filter`.
+
+```typescript
+import { createCollection, eq, gte } from '@tanstack/db'
+import { useLiveQuery } from '@tanstack/react-db'
+
+const appointments = createCollection(
+  pocketbaseCollectionOptions({
+    recordService: pb.collection('appointments'),
+    syncMode: 'on-demand',
+    options: { expand: 'customer,service' },
+  }),
+)
+
+// Loads `status = 'CONFIRMED' && datetime >= '2026-09-01 00:00:00.000Z'` sorted by `-datetime`
+useLiveQuery((q) =>
+  q
+    .from({ appointment: appointments })
+    .where(({ appointment }) => eq(appointment.status, 'CONFIRMED'))
+    .where(({ appointment }) => gte(appointment.datetime, new Date('2026-09-01')))
+    .orderBy(({ appointment }) => appointment.datetime, 'desc'),
+)
+```
+
+Supported operators: `eq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in`, `and`, `or`, and `not` on `eq` and `in` (a negated `like` cannot be expressed with PocketBase's `!~` contains operator). Field references may be nested (`calendar.organization`). Expressions that cannot be translated fall back to the base filter, which loads a superset that the live query then filters locally. `perPage` is only sent when the PocketBase filter is exact: `like` (case-sensitive in TanStack DB, not in PocketBase) and `ilike` without a `%` wildcard (PocketBase turns it into a contains match) load the full superset instead. Values are bound with `pb.filter()` when the record service exposes its client.
+
 ### With a Standard Schema
 
-Any [Standard Schema](https://standardschema.dev) compatible validator (Zod, Valibot, ArkType, …) can be passed via the `schema` field for typed records and validated mutations.
+Any [Standard Schema](https://standardschema.dev) validator (Zod, Valibot, ArkType, …) can be passed via `schema` for typed records and validated mutations. The schema validates what you insert; use `transform` for what comes from the server.
 
 ```typescript
 import { z } from 'zod'
@@ -107,63 +145,54 @@ const todos = createCollection(
 )
 ```
 
+### Sessions
+
+A collection is bound to the PocketBase auth state it was created with. When the user signs out or switches account, clean the collection up and let it restart with the new session:
+
+```typescript
+pb.authStore.onChange(() => {
+  todos.cleanup()
+})
+```
+
+`await todos.utils.refetch()` replaces the synced state with a fresh `getFullList()` without restarting the subscription. TanStack DB shares `utils` between every collection created from the same options object, so all of them are refetched.
+
 ## API
 
 ### `pocketbaseCollectionOptions(config)`
 
-Returns a `CollectionConfig` that can be passed to TanStack DB's `createCollection()`.
+Returns a `CollectionConfig` for TanStack DB's `createCollection()`.
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `recordService` | `RecordService<TItem>` | A PocketBase record service (`pb.collection('...')`). Required. |
-| `options` | `RecordFullListOptions` | Optional. Forwarded to `getFullList()` and `subscribe()`. |
-| `schema` | `StandardSchemaV1` | Optional. Provides typed records. |
-| Other | — | Any other `BaseCollectionConfig` field from TanStack DB (e.g. `id`, `gcTime`, `startSync`, `autoIndex`, `compare`, `utils`, …) is forwarded as-is. |
+| `options` | `RecordFullListOptions` | Optional. Forwarded to `getFullList()`, `getList()` and `subscribe()`. |
+| `transform` | `(record: RecordModel) => TItem` | Optional. Applied to every record coming from PocketBase. |
+| `schema` | `StandardSchemaV1` | Optional. Validates mutations and types records. |
+| `syncMode` | `'eager' \| 'on-demand'` | Optional, TanStack DB option. `on-demand` skips the initial fetch and loads from live queries. |
+| Other | — | Any other `BaseCollectionConfig` field (`id`, `gcTime`, `startSync`, `autoIndex`, `compare`, …) is forwarded as-is. |
 
-The returned config:
+The returned config sets `getKey` to the record id, registers the sync function (subscribe, then initial fetch or `loadSubset`), the `onInsert` / `onUpdate` / `onDelete` handlers, and `utils`:
 
-- sets `getKey` to `(item) => item.id` (PocketBase's record id),
-- registers a `sync` function that subscribes first, then performs an initial `getFullList()` fetch,
-- registers `onInsert` / `onUpdate` / `onDelete` mutation handlers that call PocketBase's `create` / `update` / `delete`,
-- unsubscribes when the collection is cleaned up.
+| Util | Description |
+| --- | --- |
+| `newId()` | A PocketBase-compatible record id. |
+| `refetch()` | Replaces the synced state with the current server state. |
+
+### Filter helpers
+
+`compileWhere`, `compileSort`, `combineFilters` and `buildSubsetRequest` are exported for adapters that need to translate TanStack DB expressions to PocketBase filters themselves.
 
 ## Development
 
-### Prerequisites
-
-- [Bun](https://bun.sh) `>= 1.2`
-
-### Install dependencies
+Requires [Bun](https://bun.sh) `>= 1.2`.
 
 ```bash
 bun install
-```
-
-### Build
-
-```bash
-bun run build
-```
-
-Outputs ESM (`dist/esm/`), CJS (`dist/cjs/`), and TypeScript declarations.
-
-### Watch mode
-
-```bash
-bun run dev
-```
-
-### Tests
-
-```bash
-bun test
-```
-
-### Lint / format
-
-```bash
+bun test            # unit tests with coverage
+bun run type-check
 bun run lint
-bun run format
+bun run build       # ESM, CJS and declarations in dist/
 ```
 
 ## License
