@@ -23,8 +23,9 @@ bun add pocketbase-db-collection @tanstack/db pocketbase
 
 ## Peer dependencies
 
-- `@tanstack/db` `>=0.6.0 <1` (tested against 0.9)
+- `@tanstack/db` `>=0.9.0 <1` (sync failures are reported through `markError`, which 0.9 introduced)
 - `pocketbase` `>=0.26.0 <1` (tested against 0.28)
+- Node.js `>=19` for the CJS build: `collection.utils.newId()` relies on the global `crypto`
 
 ## Usage
 
