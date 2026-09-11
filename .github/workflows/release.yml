@@ -64,7 +64,7 @@ jobs:
           test -f dist/esm/index.js
           test -f dist/esm/index.d.ts
           test -f dist/esm/pocketbase.d.ts
-          test -f dist/cjs/index.js
+          test -f dist/cjs/index.cjs
           test -f dist/cjs/index.d.cts
           test -f dist/cjs/pocketbase.d.cts
 
