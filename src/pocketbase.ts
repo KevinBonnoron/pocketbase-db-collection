@@ -33,23 +33,17 @@ export interface PocketbaseCollectionConfig<TItem extends PocketbaseRecord = Rec
   options?: RecordFullListOptions;
   /** Applied to every record coming from PocketBase (initial fetch, realtime events, mutation responses). */
   transform?: (record: RecordModel) => TItem;
+  /** Milliseconds to wait before committing buffered realtime events and mutation responses together. Defaults to 0 (next macrotask); raise it to fold longer bursts into fewer commits. */
+  batchDelay?: number;
 }
 
 type SyncParams<TItem extends PocketbaseRecord> = Parameters<SyncConfig<TItem, string>[`sync`]>[0];
 
-interface SyncSession<TItem extends PocketbaseRecord> {
-  upsert: (records: Array<TItem>) => void;
-  remove: (keys: Array<string>) => void;
-  refetch: () => Promise<void>;
-}
+type SyncEvent<TItem> = { type: `upsert`; item: TItem } | { type: `delete`; key: string; unsynced?: TItem };
 
-/**
- * TanStack DB keeps the optimistic row of a direct transaction until a sync change for its key
- * is committed *after* the transaction completes. Server state is therefore written on the next
- * macrotask, once the mutation handler has resolved.
- */
-function afterHandlerResolves(callback: () => void) {
-  setTimeout(callback, 0);
+interface SyncSession<TItem extends PocketbaseRecord> {
+  enqueue: (event: SyncEvent<TItem>) => void;
+  refetch: () => Promise<void>;
 }
 
 export function pocketbaseCollectionOptions<TSchema extends StandardSchemaV1>(
@@ -67,7 +61,7 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord>(
   schema?: never;
 };
 export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = PocketbaseRecord, TSchema extends StandardSchemaV1 = never>(config: PocketbaseCollectionConfig<TItem, TSchema>): CollectionConfig<TItem, string, TSchema, PocketbaseCollectionUtils> {
-  const { recordService, options, transform, ...restConfig } = config;
+  const { recordService, options, transform, batchDelay = 0, ...restConfig } = config;
   const toItem = (record: unknown): TItem => (transform ? transform(record as RecordModel) : (record as TItem));
   const getKey = (item: TItem) => item.id;
 
@@ -85,26 +79,95 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
       let unsubscribeFn: (() => Promise<void>) | undefined;
       let active = true;
 
-      const upsertAll = (records: Array<TItem>) => {
-        for (const record of records) {
-          const key = getKey(record);
-          if (syncedKeys.has(key)) {
-            write({ type: `update`, value: record });
-          } else {
-            write({ type: `insert`, value: record });
-            syncedKeys.add(key);
-          }
+      const upsertOne = (record: TItem) => {
+        const key = getKey(record);
+        if (syncedKeys.has(key)) {
+          write({ type: `update`, value: record });
+        } else {
+          write({ type: `insert`, value: record });
+          syncedKeys.add(key);
         }
       };
 
-      const removeAll = (keys: Array<string>) => {
-        for (const key of keys) {
-          if (!syncedKeys.has(key)) {
-            continue;
-          }
-          write({ type: `delete`, key });
-          syncedKeys.delete(key);
+      const removeOne = (key: string, unsynced?: TItem) => {
+        if (!syncedKeys.has(key)) {
+          if (!unsynced || !collection.has(key)) return;
+          write({ type: `insert`, value: unsynced });
         }
+        write({ type: `delete`, key });
+        syncedKeys.delete(key);
+      };
+
+      const upsertAll = (records: Array<TItem>) => {
+        for (const record of records) {
+          upsertOne(record);
+        }
+      };
+
+      /**
+       * Realtime events and mutation responses are buffered and committed together on a timer, so a burst
+       * of SSE messages (each one its own macrotask) costs one commit per flush instead of one per record;
+       * an isolated event pays one macrotask of latency. The timer is armed by the first event and never
+       * re-armed (a throttle, not a debounce), so a continuous stream still drains on every flush. Only the
+       * last event per key is kept, so a create followed by a delete of the same record is applied as the
+       * delete alone; when that delete replaces the buffered upsert of a key never synced yet, the insert
+       * and the delete are both written so TanStack DB still sees a sync change for the key and drops the
+       * optimistic row. The same flush also satisfies TanStack DB, which drops the optimistic row of a direct
+       * transaction only once a sync change for its key is committed after the transaction completes: a
+       * mutation handler enqueues the server response before resolving, and the flush runs on a later
+       * macrotask. While a refetch is in flight the timer is suspended and events accumulate; events
+       * enqueued after the refetch started are applied on top of the fresh snapshot instead of being wiped
+       * by its truncate, while those enqueued before it are older than the snapshot and are dropped, except
+       * a delete that must drop a retained optimistic row the snapshot does not contain.
+       */
+      const pending = new Map<string, { seq: number; event: SyncEvent<TItem> }>();
+      let sequence = 0;
+      let flushTimer: ReturnType<typeof setTimeout> | undefined;
+      let refetchGeneration = 0;
+      let newestRefetchPending = false;
+
+      const cancelFlush = () => {
+        if (flushTimer === undefined) return;
+        clearTimeout(flushTimer);
+        flushTimer = undefined;
+      };
+
+      const scheduleFlush = () => {
+        if (flushTimer !== undefined || newestRefetchPending || pending.size === 0) return;
+        flushTimer = setTimeout(flush, batchDelay);
+      };
+
+      const applyPending = (after = 0) => {
+        for (const { seq, event } of pending.values()) {
+          if (event.type === `upsert`) {
+            if (seq > after) upsertOne(event.item);
+          } else if (seq > after || (event.unsynced && !syncedKeys.has(event.key))) {
+            removeOne(event.key, event.unsynced);
+          }
+        }
+        pending.clear();
+      };
+
+      const flush = () => {
+        flushTimer = undefined;
+        if (!active || pending.size === 0) return;
+        begin();
+        applyPending();
+        commit();
+      };
+
+      const enqueue = (event: SyncEvent<TItem>) => {
+        if (!active) return;
+        const key = event.type === `upsert` ? getKey(event.item) : event.key;
+        if (event.type === `delete`) {
+          const previous = pending.get(key)?.event;
+          const unsynced = previous?.type === `upsert` ? previous.item : previous?.unsynced;
+          if (unsynced) {
+            event = { ...event, unsynced };
+          }
+        }
+        pending.set(key, { seq: ++sequence, event });
+        scheduleFlush();
       };
 
       async function fetchAll(): Promise<Array<TItem>> {
@@ -121,25 +184,35 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
       }
 
       const session: SyncSession<TItem> = {
-        upsert: (records) => {
-          if (!active) return;
-          begin();
-          upsertAll(records);
-          commit();
-        },
-        remove: (keys) => {
-          if (!active) return;
-          begin();
-          removeAll(keys);
-          commit();
-        },
+        enqueue,
         refetch: async () => {
-          const records = await fetchAll();
-          if (!active) return;
+          const generation = ++refetchGeneration;
+          const sequenceAtStart = sequence;
+          newestRefetchPending = true;
+          cancelFlush();
+          const settle = () => {
+            if (generation === refetchGeneration) {
+              newestRefetchPending = false;
+            }
+          };
+          let records: Array<TItem>;
+          try {
+            records = await fetchAll();
+          } catch (error) {
+            settle();
+            scheduleFlush();
+            throw error;
+          }
+          settle();
+          if (!active || generation !== refetchGeneration) {
+            scheduleFlush();
+            return;
+          }
           begin();
           truncate();
           syncedKeys.clear();
           upsertAll(records);
+          applyPending(sequenceAtStart);
           commit();
         },
       };
@@ -149,18 +222,15 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
         const unsubscribe = await recordService.subscribe<RecordModel>(
           `*`,
           (event) => {
-            if (!active) return;
-            begin();
             switch (event.action) {
               case `create`:
               case `update`:
-                upsertAll([toItem(event.record)]);
+                enqueue({ type: `upsert`, item: toItem(event.record) });
                 break;
               case `delete`:
-                removeAll([event.record.id]);
+                enqueue({ type: `delete`, key: event.record.id });
                 break;
             }
-            commit();
           },
           options,
         );
@@ -213,6 +283,8 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
       return {
         cleanup: () => {
           active = false;
+          cancelFlush();
+          pending.clear();
           if (sessions.get(collection) === session) {
             sessions.delete(collection);
           }
@@ -248,7 +320,7 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
           const { id, ...rest } = mutation.changes;
           const changes = id ? { id, ...rest } : rest;
           const created = toItem(await recordService.create<RecordModel>(changes));
-          afterHandlerResolves(() => session?.upsert([created]));
+          session?.enqueue({ type: `upsert`, item: created });
           return created.id;
         }),
       );
@@ -258,7 +330,7 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
       return await Promise.all(
         params.transaction.mutations.map(async ({ key, changes }) => {
           const updated = toItem(await recordService.update<RecordModel>(key, changes));
-          afterHandlerResolves(() => session?.upsert([updated]));
+          session?.enqueue({ type: `upsert`, item: updated });
           return key;
         }),
       );
@@ -268,7 +340,7 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
       return await Promise.all(
         params.transaction.mutations.map(async (mutation) => {
           await recordService.delete(mutation.key);
-          afterHandlerResolves(() => session?.remove([mutation.key]));
+          session?.enqueue({ type: `delete`, key: mutation.key });
           return mutation.key;
         }),
       );

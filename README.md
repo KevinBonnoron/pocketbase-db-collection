@@ -6,7 +6,8 @@ A [PocketBase](https://pocketbase.io) collection adapter for [TanStack DB](https
 
 - Real-time sync via PocketBase's `subscribe()`; realtime events are applied as upserts, so echoes of your own writes never raise duplicate-key errors
 - Initial data fetch with `getFullList()` after subscribing (no missed events), or query-driven loading with `syncMode: 'on-demand'`
-- Optimistic mutations forwarded to PocketBase (`create`, `update`, `delete`); the server response is written back into the synced state right after the mutation settles, so rows never flicker while waiting for the realtime echo
+- Optimistic mutations forwarded to PocketBase (`create`, `update`, `delete`); the server response is written back into the synced state as soon as the mutation settles, so rows never flicker while waiting for the realtime echo
+- Realtime events and mutation responses are batched into one commit per macrotask (tunable with `batchDelay`), so a burst of server writes does not freeze the page with one live-query recompute per record
 - Client-generated ids (`collection.utils.newId()`) so the optimistic row and the server row share the same key
 - Optional `transform` to shape every record coming from PocketBase (dates, computed fields)
 - Optional Standard Schema for typed and validated mutations
@@ -169,6 +170,7 @@ Returns a `CollectionConfig` for TanStack DB's `createCollection()`.
 | `recordService` | `RecordService<TItem>` | A PocketBase record service (`pb.collection('...')`). Required. |
 | `options` | `RecordFullListOptions` | Optional. Forwarded to `getFullList()`, `getList()` and `subscribe()`. |
 | `transform` | `(record: RecordModel) => TItem` | Optional. Applied to every record coming from PocketBase. |
+| `batchDelay` | `number` | Optional, default `0`. Milliseconds to buffer realtime events and mutation responses before committing them together. Raise it to fold longer bursts into fewer commits. |
 | `schema` | `StandardSchemaV1` | Optional. Validates mutations and types records. |
 | `syncMode` | `'eager' \| 'on-demand'` | Optional, TanStack DB option. `on-demand` skips the initial fetch and loads from live queries. |
 | Other | — | Any other `BaseCollectionConfig` field (`id`, `gcTime`, `startSync`, `autoIndex`, `compare`, …) is forwarded as-is. |
