@@ -1,4 +1,4 @@
-import { describe, expect, it, mock } from 'bun:test';
+import { describe, expect, it, jest, mock } from 'bun:test';
 import { createCollection, createLiveQueryCollection, eq } from '@tanstack/db';
 import type { RecordService, RecordSubscription } from 'pocketbase';
 import { buildSubsetRequest, compileSort, compileWhere, pocketbaseCollectionOptions, UnsupportedFilterError } from '../src';
@@ -72,6 +72,312 @@ function collectionFor(svc: FakeRecordService, extra: Record<string, unknown> = 
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
 
+function collectionWithSyncSpy(svc: FakeRecordService, extra: Record<string, unknown> = {}) {
+  const options = pocketbaseCollectionOptions({ recordService: svc as unknown as RecordService<Row>, ...extra });
+  const counts = { begin: 0, commit: 0, write: 0 };
+  const inner = options.sync.sync;
+  options.sync = {
+    ...options.sync,
+    sync: (params) =>
+      inner({
+        ...params,
+        begin: (...args) => {
+          counts.begin++;
+          return params.begin(...args);
+        },
+        write: (...args) => {
+          counts.write++;
+          return params.write(...args);
+        },
+        commit: (...args) => {
+          counts.commit++;
+          return params.commit(...args);
+        },
+      }),
+  };
+  return { collection: createCollection(options), counts };
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+
+describe(`batched sync writes`, () => {
+  it(`flushes several realtime events arriving before the timer in a single commit`, async () => {
+    const svc = service();
+    const { collection, counts } = collectionWithSyncSpy(svc);
+    await collection.stateWhenReady();
+    const commitsBefore = counts.commit;
+
+    svc.emit(`create`, { id: `a`, data: `1` });
+    svc.emit(`create`, { id: `b`, data: `2` });
+    svc.emit(`create`, { id: `c`, data: `3` });
+    expect(collection.size).toBe(0);
+    expect(counts.commit).toBe(commitsBefore);
+
+    await tick();
+    expect(counts.commit).toBe(commitsBefore + 1);
+    expect(counts.begin).toBe(counts.commit);
+    expect(collection.toArray.map((row) => row.data)).toEqual([`1`, `2`, `3`]);
+  });
+
+  it(`keeps only the last event per key, so a create followed by a delete leaves the record absent`, async () => {
+    const svc = service();
+    const { collection, counts } = collectionWithSyncSpy(svc);
+    await collection.stateWhenReady();
+    const writesBefore = counts.write;
+
+    svc.emit(`create`, { id: `kept`, data: `x` });
+    svc.emit(`create`, { id: `gone`, data: `y` });
+    svc.emit(`update`, { id: `kept`, data: `z` });
+    svc.emit(`delete`, { id: `gone`, data: `y` });
+    await tick();
+
+    expect(collection.get(`gone`)).toBeUndefined();
+    expect(collection.get(`kept`)?.data).toBe(`z`);
+    expect(collection.size).toBe(1);
+    expect(counts.write).toBe(writesBefore + 1);
+  });
+
+  it(`drops the optimistic row when a realtime delete replaces the buffered insert response`, async () => {
+    const svc = service();
+    svc.echoRealtime = false;
+    const { collection, counts } = collectionWithSyncSpy(svc, { batchDelay: 30 });
+    await collection.stateWhenReady();
+    const writesBefore = counts.write;
+
+    await collection.insert({ id: `x`, data: `1` }).isPersisted.promise;
+    expect(collection.get(`x`)?.data).toBe(`1`);
+    svc.emit(`delete`, { id: `x`, data: `1` });
+    await sleep(40);
+
+    expect(collection.get(`x`)).toBeUndefined();
+    expect(collection.size).toBe(0);
+    expect(counts.write).toBe(writesBefore + 2);
+  });
+
+  it(`re-creates a record when a create follows a delete in the same flush`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `old` });
+    const { collection } = collectionWithSyncSpy(svc);
+    await collection.stateWhenReady();
+
+    svc.emit(`delete`, { id: `a`, data: `old` });
+    svc.emit(`create`, { id: `a`, data: `new` });
+    await tick();
+
+    expect(collection.get(`a`)?.data).toBe(`new`);
+  });
+
+  it(`flushes at the first deadline under a continuous stream instead of re-arming like a debounce`, async () => {
+    const svc = service();
+    const { collection, counts } = collectionWithSyncSpy(svc, { batchDelay: 30 });
+    await collection.stateWhenReady();
+    const commitsBefore = counts.commit;
+    jest.useFakeTimers();
+    try {
+      svc.emit(`create`, { id: `a`, data: `1` });
+      fakeTimers.advanceTimersByTime(10);
+      svc.emit(`create`, { id: `b`, data: `2` });
+      fakeTimers.advanceTimersByTime(10);
+      svc.emit(`create`, { id: `c`, data: `3` });
+      fakeTimers.advanceTimersByTime(9);
+      expect(counts.commit).toBe(commitsBefore);
+
+      fakeTimers.advanceTimersByTime(1);
+      expect(counts.commit).toBe(commitsBefore + 1);
+      expect(collection.size).toBe(3);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it(`commits the responses of a multi-row transaction and their realtime echoes together`, async () => {
+    const svc = service();
+    const { collection, counts } = collectionWithSyncSpy(svc);
+    await collection.stateWhenReady();
+    const commitsBefore = counts.commit;
+    const writesBefore = counts.write;
+
+    const tx = collection.insert([
+      { id: `a`, data: `1` },
+      { id: `b`, data: `2` },
+      { id: `c`, data: `3` },
+    ]);
+    await tx.isPersisted.promise;
+    await tick();
+
+    expect(counts.commit).toBe(commitsBefore + 1);
+    expect(counts.write).toBe(writesBefore + 3);
+    expect(collection.size).toBe(3);
+    expect(collection.toArray.every((row) => (row as { $synced?: boolean }).$synced)).toBe(true);
+  });
+
+  it(`honours batchDelay`, async () => {
+    const svc = service();
+    const { collection, counts } = collectionWithSyncSpy(svc, { batchDelay: 30 });
+    await collection.stateWhenReady();
+    const commitsBefore = counts.commit;
+
+    svc.emit(`create`, { id: `a`, data: `1` });
+    await tick();
+    expect(counts.commit).toBe(commitsBefore);
+    svc.emit(`create`, { id: `b`, data: `2` });
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(counts.commit).toBe(commitsBefore + 1);
+    expect(collection.size).toBe(2);
+  });
+
+  it(`folds pending events into the refetch commit`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `server` });
+    const { collection, counts } = collectionWithSyncSpy(svc);
+    await collection.stateWhenReady();
+    const commitsBefore = counts.commit;
+
+    const refetching = collection.utils.refetch();
+    svc.emit(`create`, { id: `b`, data: `live` });
+    await refetching;
+    await tick();
+
+    expect(counts.commit).toBe(commitsBefore + 1);
+    expect(collection.get(`a`)?.data).toBe(`server`);
+    expect(collection.get(`b`)?.data).toBe(`live`);
+  });
+
+  it(`drops events buffered before the refetch started, since the snapshot is newer`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `v1` });
+    svc.records.set(`b`, { id: `b`, data: `v1` });
+    const { collection, counts } = collectionWithSyncSpy(svc, { batchDelay: 30 });
+    await collection.stateWhenReady();
+    const commitsBefore = counts.commit;
+
+    svc.emit(`update`, { id: `a`, data: `stale` });
+    svc.emit(`delete`, { id: `b`, data: `v1` });
+    svc.records.set(`a`, { id: `a`, data: `v2` });
+    await collection.utils.refetch();
+
+    expect(collection.get(`a`)?.data).toBe(`v2`);
+    expect(collection.get(`b`)?.data).toBe(`v1`);
+    await sleep(40);
+    expect(counts.commit).toBe(commitsBefore + 1);
+  });
+
+  it(`still drops an optimistic insert deleted remotely when a refetch replaces the buffer`, async () => {
+    const svc = service();
+    svc.echoRealtime = false;
+    const { collection } = collectionWithSyncSpy(svc, { batchDelay: 30 });
+    await collection.stateWhenReady();
+
+    await collection.insert({ id: `x`, data: `1` }).isPersisted.promise;
+    svc.records.delete(`x`);
+    svc.emit(`delete`, { id: `x`, data: `1` });
+    await collection.utils.refetch();
+    await sleep(40);
+
+    expect(collection.get(`x`)).toBeUndefined();
+    expect(collection.size).toBe(0);
+  });
+
+  it(`holds events arriving during a slow refetch and applies them on top of the snapshot`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `server` });
+    const { collection, counts } = collectionWithSyncSpy(svc);
+    await collection.stateWhenReady();
+    const commitsBefore = counts.commit;
+    svc.getFullList = mock(() => sleep(30).then(() => Array.from(svc.records.values())));
+
+    const refetching = collection.utils.refetch();
+    await tick();
+    svc.emit(`create`, { id: `b`, data: `live` });
+    await tick();
+    expect(counts.commit).toBe(commitsBefore);
+    expect(collection.get(`b`)).toBeUndefined();
+
+    await refetching;
+    expect(counts.commit).toBe(commitsBefore + 1);
+    expect(collection.get(`a`)?.data).toBe(`server`);
+    expect(collection.get(`b`)?.data).toBe(`live`);
+  });
+
+  it(`lets only the newest of two overlapping refetches commit`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `initial` });
+    const { collection, counts } = collectionWithSyncSpy(svc);
+    await collection.stateWhenReady();
+    const commitsBefore = counts.commit;
+    const resolvers: Array<(records: Array<Row>) => void> = [];
+    svc.getFullList = mock(() => new Promise<Array<Row>>((resolve) => resolvers.push(resolve)));
+
+    const older = collection.utils.refetch();
+    const newer = collection.utils.refetch();
+    await tick();
+    expect(resolvers.length).toBe(2);
+
+    resolvers[1]?.([{ id: `a`, data: `newer` }]);
+    await newer;
+    expect(collection.get(`a`)?.data).toBe(`newer`);
+
+    resolvers[0]?.([{ id: `a`, data: `older` }]);
+    await older;
+    await tick();
+    expect(collection.get(`a`)?.data).toBe(`newer`);
+    expect(counts.commit).toBe(commitsBefore + 1);
+  });
+
+  it(`does not let a superseded refetch that never settles block flushing`, async () => {
+    const svc = service();
+    const { collection, counts } = collectionWithSyncSpy(svc);
+    await collection.stateWhenReady();
+    const resolvers: Array<(records: Array<Row>) => void> = [];
+    svc.getFullList = mock(() => new Promise<Array<Row>>((resolve) => resolvers.push(resolve)));
+
+    void collection.utils.refetch();
+    const newer = collection.utils.refetch();
+    await tick();
+    resolvers[1]?.([{ id: `a`, data: `snapshot` }]);
+    await newer;
+    const commitsBefore = counts.commit;
+
+    svc.emit(`create`, { id: `b`, data: `live` });
+    await tick();
+    expect(counts.commit).toBe(commitsBefore + 1);
+    expect(collection.get(`a`)?.data).toBe(`snapshot`);
+    expect(collection.get(`b`)?.data).toBe(`live`);
+  });
+
+  it(`resumes flushing when the refetch fails`, async () => {
+    const svc = service();
+    const { collection, counts } = collectionWithSyncSpy(svc);
+    await collection.stateWhenReady();
+    const commitsBefore = counts.commit;
+    svc.getFullList = mock(() => sleep(10).then(() => Promise.reject(new Error(`fetch failed`))));
+
+    const refetching = collection.utils.refetch();
+    svc.emit(`create`, { id: `b`, data: `live` });
+    await expect(refetching).rejects.toThrow(`fetch failed`);
+    await tick();
+
+    expect(counts.commit).toBe(commitsBefore + 1);
+    expect(collection.get(`b`)?.data).toBe(`live`);
+  });
+
+  it(`writes nothing when cleanup runs before the flush`, async () => {
+    const svc = service();
+    const { collection, counts } = collectionWithSyncSpy(svc);
+    await collection.stateWhenReady();
+    const before = { ...counts };
+
+    svc.emit(`create`, { id: `a`, data: `1` });
+    collection.cleanup();
+    await tick();
+
+    expect(counts.begin).toBe(before.begin);
+    expect(counts.commit).toBe(before.commit);
+    expect(counts.write).toBe(before.write);
+  });
+});
 describe(`direct writes after mutations`, () => {
   it(`keeps an inserted row visible even when no realtime echo arrives`, async () => {
     const svc = service();

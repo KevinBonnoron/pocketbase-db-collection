@@ -11,7 +11,8 @@ This is a TypeScript library that provides a PocketBase adapter for TanStack DB.
 - **Adapter Pattern**: The library implements TanStack DB's `CollectionConfig` interface to bridge PocketBase's RecordService API with TanStack DB's collection model
 - **Real-time Sync**: Uses PocketBase's subscribe mechanism to listen for server changes and synchronize them to the local TanStack DB collection
 - **Sync Flow**: Listens first (via `recordService.subscribe`), then fetches initial data (via `getFullList`), ensuring no events are missed during initial load
-- **Mutation Handlers**: Implements `onInsert`, `onUpdate`, and `onDelete` to propagate local changes back to PocketBase server, then write the server response into the synced state on the next macrotask (TanStack DB only drops a direct transaction's optimistic row when a sync change for its key lands after the transaction completed)
+- **Mutation Handlers**: Implements `onInsert`, `onUpdate`, and `onDelete` to propagate local changes back to PocketBase server, then enqueue the server response into the sync buffer (TanStack DB only drops a direct transaction's optimistic row when a sync change for its key lands after the transaction completed, and the buffer flushes on a later macrotask)
+- **Batched sync writes**: realtime events and mutation responses share one buffer keyed by record id (last event wins) and are committed together on a `setTimeout(flush, batchDelay)` timer that is armed once, not re-armed
 - **Realtime upserts**: the adapter tracks synced keys itself; realtime `create`/`update` become `update` for known keys and `delete` of unknown keys is ignored
 - **On-demand mode**: `src/filter.ts` compiles live-query `where`/`orderBy`/`limit` into PocketBase `filter`/`sort`/`perPage`; untranslatable expressions fall back to the base filter
 
