@@ -136,7 +136,7 @@ The collection defaults `defaultStringCollation` to `{ stringSort: 'lexical' }`,
 
 By default every realtime create/update the user can see is applied, so new records show up in live queries but the collection keeps growing with every write on the server. Set `realtimeScope: 'loaded'` to only apply events for records already in the collection or matching the `where` of a subset loaded by an active live query; deletes and the responses of local mutations are always applied.
 
-A load response never overwrites a newer state: a realtime event or mutation response received while a load was in flight wins over the row the load returns, and a row deleted meanwhile is not written back. Likewise a load that started later (such as a refetch) wins over one that started earlier, an event received before a load cannot restore its older value once the load has committed, and a subset released while its load was in flight installs nothing.
+A load response never overwrites a newer state: a realtime event or mutation response received while a load was in flight wins over the row the load returns, and a row deleted meanwhile is not written back. Likewise a load that started later (such as a refetch) wins over one that started earlier, an event still buffered from before a load cannot restore its older value for a key the load returned, and a subset released while its load was in flight installs nothing. An on-demand refetch also drops buffered events from before it for rows no active subset returns, consistent with removing those rows from the synced state.
 
 TanStack DB 0.9 itself loads the full source of an ordered, limited live query when a row of its window is deleted or changes its sort value, since the window's cursor no longer holds.
 

@@ -346,7 +346,11 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
           );
           // A newer refetch already replaced the rows of a superseded subset, so only it may decide what to remove
           const anySuperseded = subsets.some((subset) => superseded(subset, start));
-          const removed = anySuperseded ? [] : Array.from(before).filter((key) => syncedKeys.has(key) && !records.has(key) && !newerEvent(key, start));
+          // Rows that no current subset returns leave the synced state, including an upsert buffered before the
+          // refetch started, which the next flush would otherwise install; writeLoad turns it into a delete
+          const uncovered = (key: string) => !records.has(key) && !newerEvent(key, start);
+          const bufferedUpserts = Array.from(pending, ([key, { seq, event }]) => (seq < start && event.type === `upsert` && !syncedKeys.has(key) ? key : undefined)).filter((key) => key !== undefined);
+          const removed = anySuperseded ? [] : [...Array.from(before).filter((key) => syncedKeys.has(key)), ...bufferedUpserts].filter(uncovered);
           begin();
           writeLoad(records, removed, start);
           for (const { subset } of current) refreshedBy.set(subset, start);

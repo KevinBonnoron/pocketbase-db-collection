@@ -1112,4 +1112,39 @@ describe(`on-demand live queries`, () => {
 
     expect(rows.get(`a`)?.updated).toBe(`2`);
   });
+
+  it(`refetch drops an upsert buffered before it for a row no active subset returns`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `open` });
+    const rows = onDemand(svc, { batchDelay: 30 });
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    await open.preload();
+
+    // Created then deleted on the server; the delete event was missed and the refetch repairs it
+    svc.emit(`create`, { id: `x`, data: `open` });
+    await rows.utils.refetch();
+    await sleep(60);
+
+    expect(rows.get(`x`)).toBeUndefined();
+    expect(open.toArray.map(({ id }) => id)).toEqual([`a`]);
+  });
+
+  it(`still settles the optimistic row of a mutation whose buffered response a refetch drops`, async () => {
+    const svc = service();
+    svc.echoRealtime = false;
+    svc.records.set(`a`, { id: `a`, data: `open` });
+    const rows = onDemand(svc, { batchDelay: 30 });
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    await open.preload();
+
+    const id = rows.utils.newId();
+    const tx = rows.insert({ id, data: `draft` });
+    await tx.isPersisted.promise;
+    await rows.utils.refetch();
+    await sleep(60);
+
+    // The draft matches no active subset, so the refetch removes it like any uncovered row, without leaving it optimistic
+    expect(rows.get(id)).toBeUndefined();
+    expect(rows.size).toBe(1);
+  });
 });
