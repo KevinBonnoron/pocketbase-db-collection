@@ -1113,21 +1113,30 @@ describe(`on-demand live queries`, () => {
     expect(rows.get(`a`)?.updated).toBe(`2`);
   });
 
-  it(`refetch drops an upsert buffered before it for a row no active subset returns`, async () => {
-    const svc = service();
-    svc.records.set(`a`, { id: `a`, data: `open` });
-    const rows = onDemand(svc, { batchDelay: 30 });
-    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
-    await open.preload();
+  for (const [label, responseDelay] of [
+    [`before the buffer flushes`, 0],
+    [`after the buffer flushed during the requests`, 60],
+  ] as const) {
+    it(`refetch drops an upsert buffered before it for a row no active subset returns, when it answers ${label}`, async () => {
+      const svc = service();
+      svc.records.set(`a`, { id: `a`, data: `open` });
+      const rows = onDemand(svc, { batchDelay: 30 });
+      const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+      await open.preload();
 
-    // Created then deleted on the server; the delete event was missed and the refetch repairs it
-    svc.emit(`create`, { id: `x`, data: `open` });
-    await rows.utils.refetch();
-    await sleep(60);
+      // Created then deleted on the server; the delete event was missed and the refetch repairs it
+      svc.emit(`create`, { id: `x`, data: `open` });
+      svc.getFullList.mockImplementationOnce(async (options?: ListOptions) => {
+        await sleep(responseDelay);
+        return svc.query(options);
+      });
+      await rows.utils.refetch();
+      await sleep(60);
 
-    expect(rows.get(`x`)).toBeUndefined();
-    expect(open.toArray.map(({ id }) => id)).toEqual([`a`]);
-  });
+      expect(rows.get(`x`)).toBeUndefined();
+      expect(open.toArray.map(({ id }) => id)).toEqual([`a`]);
+    });
+  }
 
   it(`still settles the optimistic row of a mutation whose buffered response a refetch drops`, async () => {
     const svc = service();

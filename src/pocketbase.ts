@@ -335,7 +335,13 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
       const refetchSubsets = async () => {
         const start = startLoad();
         try {
-          const before = new Set(syncedKeys);
+          // Rows that no current subset returns leave the synced state: those synced when the refetch starts, and
+          // those with an upsert still buffered then, whether the timer installs it during the requests or writeLoad
+          // turns it into a delete
+          const candidates = new Set(syncedKeys);
+          for (const [key, { event }] of pending) {
+            if (event.type === `upsert`) candidates.add(key);
+          }
           const subsets = Array.from(activeSubsets.keys()).filter(isCurrent);
           const results = await mapConcurrently(subsets, (subset) => fetchSubset(subset, undefined));
           if (!active) return;
@@ -346,11 +352,9 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
           );
           // A newer refetch already replaced the rows of a superseded subset, so only it may decide what to remove
           const anySuperseded = subsets.some((subset) => superseded(subset, start));
-          // Rows that no current subset returns leave the synced state, including an upsert buffered before the
-          // refetch started, which the next flush would otherwise install; writeLoad turns it into a delete
           const uncovered = (key: string) => !records.has(key) && !newerEvent(key, start);
-          const bufferedUpserts = Array.from(pending, ([key, { seq, event }]) => (seq < start && event.type === `upsert` && !syncedKeys.has(key) ? key : undefined)).filter((key) => key !== undefined);
-          const removed = anySuperseded ? [] : [...Array.from(before).filter((key) => syncedKeys.has(key)), ...bufferedUpserts].filter(uncovered);
+          const installed = (key: string) => syncedKeys.has(key) || pending.get(key)?.event.type === `upsert`;
+          const removed = anySuperseded ? [] : Array.from(candidates).filter((key) => installed(key) && uncovered(key));
           begin();
           writeLoad(records, removed, start);
           for (const { subset } of current) refreshedBy.set(subset, start);
