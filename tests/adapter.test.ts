@@ -644,6 +644,16 @@ describe(`on-demand sync`, () => {
     }
     expect(pairs.size).toBe(owners.length * tags.length);
   });
+
+  it(`does not split when it cannot help or would take too many requests, and sends the filter for PocketBase to reject`, () => {
+    const ids = (prefix: string, length: number) => Array.from({ length }, (_, i) => `${prefix}${String(i).padStart(13, `0`)}`);
+    const twoLists = (length: number) => fn(`and`, fn(`in`, ref(`owner`), val(ids(`o`, length))), fn(`in`, ref(`tag`), val(ids(`t`, length))));
+
+    // Even single values exceed the limit next to this base filter: no split, instead of 62,500 invalid filters
+    expect(buildSubsetRequest({ where: twoLists(250) } as never, `note = '${`x`.repeat(3480)}'`, undefined).filters).toHaveLength(1);
+    // Two lists of 2000 values would multiply into hundreds of requests
+    expect(buildSubsetRequest({ where: twoLists(2000) } as never, undefined, undefined).filters).toHaveLength(1);
+  });
 });
 
 describe(`shared options`, () => {
@@ -966,6 +976,32 @@ describe(`on-demand live queries`, () => {
 
     expect(rows.get(`a`)?.data).toBe(`closed`);
     expect(open.toArray).toEqual([]);
+  });
+
+  it(`does not let a load that started before a refetch overwrite the refetched state`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `open` });
+    svc.records.set(`b`, { id: `b`, data: `open`, updated: `1` });
+    const stale = Promise.withResolvers<Array<Row>>();
+    svc.getFullList.mockImplementationOnce(() => stale.promise);
+    const rows = onDemand(svc);
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    const loading = open.preload();
+    await tick();
+
+    // Changes missed by realtime, repaired by the refetch while the first load is still in flight
+    svc.records.delete(`a`);
+    svc.records.set(`b`, { id: `b`, data: `open`, updated: `2` });
+    await rows.utils.refetch();
+    stale.resolve([
+      { id: `a`, data: `open` },
+      { id: `b`, data: `open`, updated: `1` },
+    ]);
+    await loading;
+    await tick();
+
+    expect(rows.get(`a`)).toBeUndefined();
+    expect(rows.get(`b`)?.updated).toBe(`2`);
   });
 
   it(`applies every realtime event by default`, async () => {

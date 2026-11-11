@@ -248,35 +248,52 @@ function inListLength(expr: BasicExpression): number {
   return field?.type === `ref` && values?.type === `val` && Array.isArray(values.value) ? values.value.length : 0;
 }
 
+/** Upper bound on the requests one subset may be split into; splitting several lists multiplies their parts. */
+const MAX_SPLIT_REQUESTS = 64;
+
+function withInList(parts: Array<BasicExpression>, index: number, values: Array<unknown>): Array<BasicExpression> {
+  const [field] = (parts[index] as BasicExpression & { args: Array<BasicExpression> }).args;
+  const next = parts.slice();
+  next[index] = { type: `func`, name: `in`, args: [field, { type: `val`, value: values }] } as unknown as BasicExpression;
+  return next;
+}
+
 /**
  * Halves the longest `in` list among the top-level conjuncts of `where`, recursively, until every filter fits
  * PocketBase's limits; each recursion picks the longest list again, so several large lists are all split. The
  * subset is the union of the parts, which only holds for a conjunct: a negated or nested `in` is never split.
- * A part that still exceeds the limits once no list can be halved is returned as is, and PocketBase rejects it.
- * Returns undefined when `where` has no list to split.
+ * Returns undefined, so the request is sent unsplit and PocketBase reports the error, when `where` has no list to
+ * split, when the filter would not fit even with every list reduced to its longest value, or when fitting it
+ * would take more than MAX_SPLIT_REQUESTS requests.
  */
 function splitInLists(where: BasicExpression, bind: FilterBinder, wrap: (filter: string | undefined) => string | undefined): Array<string | undefined> | undefined {
-  const split = (parts: Array<BasicExpression>): Array<string | undefined> => {
-    const expr = parts.length === 1 ? (parts[0] as BasicExpression) : ({ type: `func`, name: `and`, args: parts } as unknown as BasicExpression);
-    const filter = wrap(compileWhereWithExactness(expr, bind).filter);
+  const render = (parts: Array<BasicExpression>) => wrap(compileWhereWithExactness(parts.length === 1 ? (parts[0] as BasicExpression) : ({ type: `func`, name: `and`, args: parts } as unknown as BasicExpression), bind).filter);
+  const valuesOf = (part: BasicExpression) => Array.from(new Set((part as BasicExpression & { args: [BasicExpression, { value: Array<unknown> }] }).args[1].value));
+
+  const parts = conjuncts(where);
+  const lists = parts.flatMap((part, index) => (inListLength(part) > 1 ? [index] : []));
+  if (lists.length === 0) return undefined;
+  const smallest = lists.reduce((reduced, index) => withInList(reduced, index, [valuesOf(parts[index] as BasicExpression).reduce((longest, value) => (String(value).length > String(longest).length ? value : longest))]), parts);
+  if (!fitsPocketbaseLimits(render(smallest))) return undefined;
+
+  const filters: Array<string | undefined> = [];
+  const split = (current: Array<BasicExpression>): boolean => {
+    const filter = render(current);
     let index = -1;
-    parts.forEach((part, i) => {
-      if (inListLength(part) > 1 && (index < 0 || inListLength(part) > inListLength(parts[index] as BasicExpression))) {
+    current.forEach((part, i) => {
+      if (inListLength(part) > 1 && (index < 0 || inListLength(part) > inListLength(current[index] as BasicExpression))) {
         index = i;
       }
     });
-    if (index < 0 || fitsPocketbaseLimits(filter)) return [filter];
-    const [field, values] = (parts[index] as BasicExpression & { args: [BasicExpression, { value: Array<unknown> }] }).args;
-    const list = Array.from(new Set(values.value));
-    const middle = Math.ceil(list.length / 2);
-    return [list.slice(0, middle), list.slice(middle)].flatMap((chunk) => {
-      const next = parts.slice();
-      next[index] = { type: `func`, name: `in`, args: [field, { type: `val`, value: chunk }] } as unknown as BasicExpression;
-      return split(next);
-    });
+    if (index < 0 || fitsPocketbaseLimits(filter)) {
+      filters.push(filter);
+      return filters.length <= MAX_SPLIT_REQUESTS;
+    }
+    const values = valuesOf(current[index] as BasicExpression);
+    const middle = Math.ceil(values.length / 2);
+    return split(withInList(current, index, values.slice(0, middle))) && split(withInList(current, index, values.slice(middle)));
   };
-  const parts = conjuncts(where);
-  return parts.some((part) => inListLength(part) > 1) ? split(parts) : undefined;
+  return split(parts) ? filters : undefined;
 }
 
 export interface SubsetRequest {
