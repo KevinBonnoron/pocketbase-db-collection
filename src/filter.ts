@@ -249,35 +249,34 @@ function inListLength(expr: BasicExpression): number {
 }
 
 /**
- * Splits the longest `in` list among the top-level conjuncts of `where` until every filter fits PocketBase's
- * limits. The subset is the union of the parts, which only holds for a conjunct: a negated or nested `in` is
- * never split. Returns undefined when there is nothing to split.
+ * Halves the longest `in` list among the top-level conjuncts of `where`, recursively, until every filter fits
+ * PocketBase's limits; each recursion picks the longest list again, so several large lists are all split. The
+ * subset is the union of the parts, which only holds for a conjunct: a negated or nested `in` is never split.
+ * A part that still exceeds the limits once no list can be halved is returned as is, and PocketBase rejects it.
+ * Returns undefined when `where` has no list to split.
  */
-function splitInList(where: BasicExpression, bind: FilterBinder, wrap: (filter: string | undefined) => string | undefined): Array<string | undefined> | undefined {
+function splitInLists(where: BasicExpression, bind: FilterBinder, wrap: (filter: string | undefined) => string | undefined): Array<string | undefined> | undefined {
+  const split = (parts: Array<BasicExpression>): Array<string | undefined> => {
+    const expr = parts.length === 1 ? (parts[0] as BasicExpression) : ({ type: `func`, name: `and`, args: parts } as unknown as BasicExpression);
+    const filter = wrap(compileWhereWithExactness(expr, bind).filter);
+    let index = -1;
+    parts.forEach((part, i) => {
+      if (inListLength(part) > 1 && (index < 0 || inListLength(part) > inListLength(parts[index] as BasicExpression))) {
+        index = i;
+      }
+    });
+    if (index < 0 || fitsPocketbaseLimits(filter)) return [filter];
+    const [field, values] = (parts[index] as BasicExpression & { args: [BasicExpression, { value: Array<unknown> }] }).args;
+    const list = Array.from(new Set(values.value));
+    const middle = Math.ceil(list.length / 2);
+    return [list.slice(0, middle), list.slice(middle)].flatMap((chunk) => {
+      const next = parts.slice();
+      next[index] = { type: `func`, name: `in`, args: [field, { type: `val`, value: chunk }] } as unknown as BasicExpression;
+      return split(next);
+    });
+  };
   const parts = conjuncts(where);
-  let index = -1;
-  parts.forEach((part, i) => {
-    if (inListLength(part) > 1 && (index < 0 || inListLength(part) > inListLength(parts[index] as BasicExpression))) {
-      index = i;
-    }
-  });
-  const target = parts[index];
-  if (target?.type !== `func`) return undefined;
-  const [field, values] = target.args as [BasicExpression, BasicExpression & { value: Array<unknown> }];
-
-  const render = (chunk: Array<unknown>) => {
-    const next = parts.slice();
-    next[index] = { type: `func`, name: `in`, args: [field, { type: `val`, value: chunk }] } as unknown as BasicExpression;
-    const expr = next.length === 1 ? (next[0] as BasicExpression) : ({ type: `func`, name: `and`, args: next } as unknown as BasicExpression);
-    return wrap(compileWhereWithExactness(expr, bind).filter);
-  };
-  const split = (chunk: Array<unknown>): Array<string | undefined> => {
-    const filter = render(chunk);
-    if (chunk.length <= 1 || fitsPocketbaseLimits(filter)) return [filter];
-    const middle = Math.ceil(chunk.length / 2);
-    return [...split(chunk.slice(0, middle)), ...split(chunk.slice(middle))];
-  };
-  return split(Array.from(new Set(values.value)));
+  return parts.some((part) => inListLength(part) > 1) ? split(parts) : undefined;
 }
 
 export interface SubsetRequest {
@@ -324,7 +323,7 @@ export function buildSubsetRequest(options: LoadSubsetOptions, baseFilter: strin
 
   const wrap = (where: string | undefined) => combineFilters(baseFilter, where, cursor);
   const filter = wrap(compiled?.filter);
-  const filters = (!fitsPocketbaseLimits(filter) && compiled && options.where && splitInList(options.where, bind, wrap)) || [filter];
+  const filters = (!fitsPocketbaseLimits(filter) && compiled && options.where && splitInLists(options.where, bind, wrap)) || [filter];
 
   return { filters, sort, perPage };
 }

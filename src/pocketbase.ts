@@ -226,37 +226,103 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
 
       const onDemand = collection.config.syncMode === `on-demand`;
       const filterRealtime = onDemand && realtimeScope === `loaded`;
-      /** `where` predicates of the subsets acquired by active live queries, released by `unloadSubset` with the same options object. */
-      const subsetPredicates = new Map<LoadSubsetOptions, (item: TItem) => boolean>();
-      const inflightLoads = new Set<Promise<void>>();
+      const matchAll = () => true;
+      /** Subsets acquired by active live queries, released by `unloadSubset` with the same options object, with their `where` predicate when realtime events are filtered. */
+      const activeSubsets = new Map<LoadSubsetOptions, (item: TItem) => boolean>();
+
+      /**
+       * A load response can be older than the realtime events and mutation responses received while it was in
+       * flight: a row deleted or changed meanwhile would be written back with its stale value. While loads are in
+       * flight, the last such event per key is recorded (before `realtimeScope` filtering, which may drop it), and
+       * each load replaces the records changed after it started with the event's value, or drops the deleted ones.
+       */
+      const observed = new Map<string, { seq: number; event: SyncEvent<TItem> }>();
+      let observedSequence = 0;
+      let loadsInFlight = 0;
+
+      const observe = (event: SyncEvent<TItem>) => {
+        if (loadsInFlight === 0) return;
+        observed.set(event.type === `upsert` ? getKey(event.item) : event.key, { seq: ++observedSequence, event });
+      };
+
+      const startLoad = () => {
+        loadsInFlight++;
+        return observedSequence;
+      };
+
+      const endLoad = () => {
+        if (--loadsInFlight === 0) observed.clear();
+      };
+
+      const newerEvent = (key: string, since: number) => {
+        const latest = observed.get(key);
+        return latest && latest.seq > since ? latest.event : undefined;
+      };
+
+      const reconcile = (lists: Array<Array<RecordModel>>, since: number) => {
+        const records = new Map<string, TItem>();
+        for (const list of lists) {
+          for (const record of list) {
+            const item = toItem(record);
+            const key = getKey(item);
+            const latest = newerEvent(key, since);
+            if (latest?.type === `delete`) continue;
+            records.set(key, latest?.type === `upsert` ? latest.item : item);
+          }
+        }
+        return records;
+      };
 
       const isLoaded = (item: TItem) => {
         const key = getKey(item);
         if (syncedKeys.has(key) || pending.has(key)) return true;
-        for (const matches of subsetPredicates.values()) {
+        for (const matches of activeSubsets.values()) {
           if (matches(item)) return true;
         }
         return false;
       };
 
+      /** Runs the PocketBase requests of a subset: one per filter (several when an `in` list was split), each paged by `perPage` when set. */
+      const fetchSubset = (subset: LoadSubsetOptions, signal: AbortSignal | undefined) => {
+        const request = buildSubsetRequest(subset, options?.filter, options?.sort, bind);
+        return mapConcurrently(request.filters, (filter) => {
+          const requestOptions: RecordFullListOptions = { ...options, filter, sort: request.sort, signal, requestKey: null };
+          return request.perPage === undefined ? recordService.getFullList<RecordModel>(requestOptions) : fetchFirst(request.perPage, requestOptions);
+        });
+      };
+
+      /**
+       * Reloads the subsets of the active live queries and replaces the synced state with them in one commit: rows
+       * synced before the refetch that no subset returns are deleted. Truncating instead would make TanStack DB
+       * replay every subscription, and an ordered one replays as a full-source load of the whole collection.
+       */
+      const refetchSubsets = async () => {
+        const since = startLoad();
+        try {
+          const before = new Set(syncedKeys);
+          const subsets = Array.from(activeSubsets.keys()).filter((subset) => !subset.signal?.aborted);
+          const lists = (await mapConcurrently(subsets, (subset) => fetchSubset(subset, undefined))).flat();
+          if (!active) return;
+          const records = reconcile(lists, since);
+          begin();
+          for (const key of before) {
+            if (syncedKeys.has(key) && !records.has(key) && !newerEvent(key, since)) removeOne(key);
+          }
+          upsertAll(Array.from(records.values()));
+          await commit();
+        } finally {
+          endLoad();
+        }
+      };
+
       const session: SyncSession<TItem> = {
-        enqueue,
+        enqueue: (event) => {
+          observe(event);
+          enqueue(event);
+        },
         refetch: async () => {
           if (onDemand) {
-            // Truncating makes TanStack DB replay the subsets of every active live query through loadSubset, which
-            // is what an on-demand collection holds; a full fetch would load the whole PocketBase collection.
-            if (!active) return;
-            cancelFlush();
-            const loadsBefore = new Set(inflightLoads);
-            begin();
-            truncate();
-            syncedKeys.clear();
-            applyPending();
-            commit();
-            // TanStack DB starts the replay on the microtask queued by the truncate; wait for it, then for the loads it
-            // started, so `await refetch()` resolves once the fresh rows are visible.
-            await Promise.resolve();
-            await Promise.all(Array.from(inflightLoads).filter((load) => !loadsBefore.has(load)));
+            if (active) await refetchSubsets();
             return;
           }
           const generation = ++refetchGeneration;
@@ -298,15 +364,19 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
             switch (event.action) {
               case `create`:
               case `update`: {
-                const item = toItem(event.record);
-                if (!filterRealtime || isLoaded(item)) {
-                  enqueue({ type: `upsert`, item });
+                const upsert: SyncEvent<TItem> = { type: `upsert`, item: toItem(event.record) };
+                observe(upsert);
+                if (!filterRealtime || isLoaded(upsert.item)) {
+                  enqueue(upsert);
                 }
                 break;
               }
-              case `delete`:
-                enqueue({ type: `delete`, key: event.record.id });
+              case `delete`: {
+                const removal: SyncEvent<TItem> = { type: `delete`, key: event.record.id };
+                observe(removal);
+                enqueue(removal);
                 break;
+              }
             }
           },
           options,
@@ -354,39 +424,28 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
         if (subset.signal?.aborted) {
           return Promise.resolve();
         }
-        if (filterRealtime) {
-          subsetPredicates.set(subset, predicateFor(subset.where));
-        }
-        const request = buildSubsetRequest(subset, options?.filter, options?.sort, bind);
-        const fetchFilter = (filter: string | undefined) => {
-          const requestOptions: RecordFullListOptions = { ...options, filter, sort: request.sort, signal: subset.signal, requestKey: null };
-          return request.perPage === undefined ? recordService.getFullList<RecordModel>(requestOptions) : fetchFirst(request.perPage, requestOptions);
-        };
-        const load = mapConcurrently(request.filters, fetchFilter).then(
-          async (lists) => {
-            if (!active || subset.signal?.aborted) return;
-            begin();
-            for (const records of lists) {
-              upsertAll(records.map(toItem));
-            }
-            // The load settles once its rows are visible (the contract of LoadSubsetFn), which `refetch` relies on
-            await commit();
-          },
-          (error: unknown) => {
-            if (subset.signal?.aborted || (error as { isAbort?: boolean })?.isAbort) return;
-            throw error;
-          },
-        );
-        inflightLoads.add(load);
-        void load.then(
-          () => inflightLoads.delete(load),
-          () => inflightLoads.delete(load),
-        );
-        return load;
+        activeSubsets.set(subset, filterRealtime ? predicateFor(subset.where) : matchAll);
+        const since = startLoad();
+        return fetchSubset(subset, subset.signal)
+          .then(
+            async (lists) => {
+              if (!active || subset.signal?.aborted) return;
+              const records = reconcile(lists, since);
+              begin();
+              upsertAll(Array.from(records.values()));
+              // The load settles once its rows are visible, as the LoadSubsetFn contract requires
+              await commit();
+            },
+            (error: unknown) => {
+              if (subset.signal?.aborted || (error as { isAbort?: boolean })?.isAbort) return;
+              throw error;
+            },
+          )
+          .finally(endLoad);
       };
 
       const unloadSubset = (subset: LoadSubsetOptions) => {
-        subsetPredicates.delete(subset);
+        activeSubsets.delete(subset);
       };
 
       start();

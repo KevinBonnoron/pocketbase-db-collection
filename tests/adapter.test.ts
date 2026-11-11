@@ -627,6 +627,23 @@ describe(`on-demand sync`, () => {
     // A negated list is not a union of its parts
     expect(buildSubsetRequest({ where: fn(`not`, fn(`in`, ref(`id`), val(ids))) } as never, undefined, undefined).filters).toHaveLength(1);
   });
+
+  it(`splits every oversized in list, so two large lists still produce filters within the limits`, () => {
+    const ids = (prefix: string) => Array.from({ length: 250 }, (_, i) => `${prefix}${String(i).padStart(13, `0`)}`);
+    const [owners, tags] = [ids(`o`), ids(`t`)];
+    const { filters } = buildSubsetRequest({ where: fn(`and`, fn(`in`, ref(`owner`), val(owners)), fn(`in`, ref(`tag`), val(tags))) } as never, undefined, undefined);
+
+    const pairs = new Set<string>();
+    for (const filter of filters as Array<string>) {
+      expect(new TextEncoder().encode(filter).length).toBeLessThanOrEqual(3500);
+      expect(filter.match(/ = /g)?.length ?? 0).toBeLessThanOrEqual(200);
+      const values = (field: string) => Array.from(filter.matchAll(new RegExp(`${field} = '(\\w+)'`, `g`)), (match) => match[1]);
+      for (const owner of values(`owner`)) {
+        for (const tag of values(`tag`)) pairs.add(`${owner}/${tag}`);
+      }
+    }
+    expect(pairs.size).toBe(owners.length * tags.length);
+  });
 });
 
 describe(`shared options`, () => {
@@ -882,6 +899,73 @@ describe(`on-demand live queries`, () => {
     expect(rows.get(`c`)?.data).toBe(`open`);
     expect(rows.get(`b`)).toBeUndefined();
     expect(svc.getFullList.mock.calls.map(([options]) => options?.filter)).toEqual([`data = 'open'`, `data = 'open'`]);
+  });
+
+  it(`refetch keeps an ordered, limited query bounded instead of loading the full source`, async () => {
+    const svc = service();
+    for (let i = 0; i < 50; i++) {
+      const id = `r${String(i).padStart(3, `0`)}`;
+      svc.records.set(id, { id, data: `x`, created: `2026-01-01 00:00:${String(i).padStart(2, `0`)}.000Z` });
+    }
+    const rows = onDemand(svc);
+    const latest = createLiveQueryCollection((q) =>
+      q
+        .from({ row: rows })
+        .orderBy(({ row }) => row.created, `desc`)
+        .limit(10),
+    );
+    await latest.preload();
+    svc.records.set(`r049`, { ...(svc.records.get(`r049`) as Row), data: `changed` });
+    svc.getList.mockClear();
+    svc.getFullList.mockClear();
+
+    await rows.utils.refetch();
+    await tick();
+
+    // Only the active subsets are replayed: the first page and the rows equal to its boundary
+    expect(svc.getList.mock.calls.map(([page, perPage, options]) => [page, perPage, options?.filter])).toEqual([[1, 10, undefined]]);
+    expect(svc.getFullList.mock.calls.map(([options]) => options?.filter)).toEqual([`created = '2026-01-01 00:00:40.000Z'`]);
+    expect(latest.toArray[0]?.data).toBe(`changed`);
+    expect(rows.size).toBe(10);
+  });
+
+  it(`does not write back a row deleted while its load was in flight`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `open` });
+    const response = Promise.withResolvers<Array<Row>>();
+    svc.getFullList.mockImplementationOnce(() => response.promise);
+    const rows = onDemand(svc);
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    const loading = open.preload();
+    await tick();
+
+    svc.emit(`delete`, { id: `a`, data: `open` });
+    await tick();
+    response.resolve([{ id: `a`, data: `open` }]);
+    await loading;
+    await tick();
+
+    expect(rows.get(`a`)).toBeUndefined();
+  });
+
+  it(`with realtimeScope 'loaded', applies an update received while the load that returns the row was in flight`, async () => {
+    const svc = service();
+    const response = Promise.withResolvers<Array<Row>>();
+    svc.getFullList.mockImplementationOnce(() => response.promise);
+    const rows = onDemand(svc, { realtimeScope: `loaded` });
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    const loading = open.preload();
+    await tick();
+
+    // Dropped by the realtime filter: the key is not loaded yet and the new value does not match the subset
+    svc.emit(`update`, { id: `a`, data: `closed` });
+    await tick();
+    response.resolve([{ id: `a`, data: `open` }]);
+    await loading;
+    await tick();
+
+    expect(rows.get(`a`)?.data).toBe(`closed`);
+    expect(open.toArray).toEqual([]);
   });
 
   it(`applies every realtime event by default`, async () => {

@@ -132,9 +132,13 @@ Paging: an ordered, limited live query on a single column loads its first page w
 
 An `in` list too long for PocketBase's filter limits (3500 bytes, 200 comparisons) is split into several requests whose results are committed together, as long as the `in` is a top-level conjunct of the `where`.
 
-The collection defaults `defaultStringCollation` to `{ stringSort: 'lexical' }`, the byte order SQLite uses. TanStack DB otherwise sorts strings by locale and, since it cannot express a locale order as a cursor, loads the full source for every ordered query on a text or date field. Override it if you need locale ordering in the UI.
+The collection defaults `defaultStringCollation` to `{ stringSort: 'lexical' }`, to match the byte order SQLite uses. TanStack DB otherwise sorts strings by locale and, since it cannot express a locale order as a cursor, loads the full source for every ordered query on a text or date field. Override it if you need locale ordering in the UI. The match is exact for ids, dates and any text below U+E000; JavaScript compares UTF-16 code units and SQLite compares UTF-8 bytes, so an ordered, limited query on a field mixing characters above U+FFFF (emoji) with characters in U+E000–U+FFFF (full-width forms, private use) can page differently from the server. Order such a field with `{ stringSort: 'locale' }` in the query's `orderBy` options: that query then loads its whole filtered source.
 
 By default every realtime create/update the user can see is applied, so new records show up in live queries but the collection keeps growing with every write on the server. Set `realtimeScope: 'loaded'` to only apply events for records already in the collection or matching the `where` of a subset loaded by an active live query; deletes and the responses of local mutations are always applied.
+
+A load response never overwrites a newer state: a realtime event or mutation response received while a load was in flight wins over the row the load returns, and a row deleted meanwhile is not written back.
+
+TanStack DB 0.9 itself loads the full source of an ordered, limited live query when a row of its window is deleted or changes its sort value, since the window's cursor no longer holds.
 
 ### With a Standard Schema
 
@@ -167,7 +171,7 @@ pb.authStore.onChange(() => {
 })
 ```
 
-`await todos.utils.refetch()` replaces the synced state with the server state without restarting the subscription: an eager collection re-runs `getFullList()`, an on-demand collection reloads the subsets of its active live queries. TanStack DB shares `utils` between every collection created from the same options object, so all of them are refetched.
+`await todos.utils.refetch()` replaces the synced state with the server state without restarting the subscription. An eager collection re-runs `getFullList()`. An on-demand collection reloads the subsets of its active live queries and commits them at once; rows that no subset returns any more are removed. TanStack DB shares `utils` between every collection created from the same options object, so all of them are refetched.
 
 ## API
 
