@@ -5,6 +5,13 @@ type OrderBy = NonNullable<LoadSubsetOptions['orderBy']>;
 
 export type FilterBinder = (raw: string, params: Record<string, unknown>) => string;
 
+/** PocketBase rejects a `filter` longer than this many bytes (`search.MaxFilterLength`). */
+export const MAX_FILTER_LENGTH = 3500;
+/** PocketBase rejects a `filter` with more comparisons than this (`search.DefaultFilterExprLimit`). */
+export const MAX_FILTER_EXPRESSIONS = 200;
+/** PocketBase silently caps `perPage` at this value (`search.MaxPerPage`). */
+export const MAX_PER_PAGE = 1000;
+
 export class UnsupportedFilterError extends Error {
   constructor(detail: string) {
     super(`Cannot translate expression to a PocketBase filter: ${detail}`);
@@ -26,15 +33,15 @@ const NEGATED_COMPARISONS: Record<string, string> = {
   eq: `!=`,
 };
 
+/** TanStack DB passes row-relative paths to `loadSubset` (`['calendar', 'organization']`), never prefixed with the query alias. */
 function fieldPath(expr: BasicExpression): string {
   if (expr.type !== `ref`) {
     throw new UnsupportedFilterError(`expected a field reference, got ${expr.type}`);
   }
-  const path = expr.path.length > 1 ? expr.path.slice(1) : expr.path;
-  if (path.length === 0) {
+  if (expr.path.length === 0) {
     throw new UnsupportedFilterError(`empty field reference`);
   }
-  return path.join(`.`);
+  return expr.path.join(`.`);
 }
 
 function literal(expr: BasicExpression): unknown {
@@ -64,7 +71,7 @@ function formatValue(value: unknown): string {
 class FilterCompiler {
   private counter = 0;
   readonly params: Record<string, unknown> = {};
-  /** False when the PocketBase filter matches a superset of the expression: `~` is case-insensitive and wraps a pattern without `%` in `%…%`. */
+  /** False when the PocketBase filter matches a superset of the expression (see `likePattern`). */
   exact = true;
 
   private bind(value: unknown): string {
@@ -111,7 +118,7 @@ class FilterCompiler {
       const path = fieldPath(field);
       const operator = negated ? `!=` : `=`;
       const joiner = negated ? ` && ` : ` || `;
-      return `(${list.map((value) => `${path} ${operator} ${this.bind(value)}`).join(joiner)})`;
+      return `(${Array.from(new Set(list), (value) => `${path} ${operator} ${this.bind(value)}`).join(joiner)})`;
     }
 
     const operator = negated ? NEGATED_COMPARISONS[name] : COMPARISONS[name];
@@ -124,30 +131,46 @@ class FilterCompiler {
       throw new UnsupportedFilterError(`${name} without two operands`);
     }
 
+    const isLike = name === `like` || name === `ilike`;
     if (left.type === `ref`) {
       const value = literal(right);
-      this.trackLikeExactness(name, value);
-      return `${fieldPath(left)} ${operator} ${this.bind(value)}`;
+      return `${fieldPath(left)} ${operator} ${this.bind(isLike ? this.likePattern(name, value) : value)}`;
     }
     if (right.type === `ref`) {
-      if (name === `like` || name === `ilike`) {
+      if (isLike) {
         throw new UnsupportedFilterError(`${name} with the pattern on the field side`);
       }
       const flipped: Record<string, string> = { '>': `<`, '>=': `<=`, '<': `>`, '<=': `>=` };
-      const value = literal(left);
-      this.trackLikeExactness(name, value);
-      return `${fieldPath(right)} ${flipped[operator] ?? operator} ${this.bind(value)}`;
+      return `${fieldPath(right)} ${flipped[operator] ?? operator} ${this.bind(literal(left))}`;
     }
     throw new UnsupportedFilterError(`${name} between two literals`);
   }
 
-  private trackLikeExactness(name: string, pattern: unknown) {
-    if (name === `ilike` && typeof pattern === `string` && /[^\p{ASCII}]/u.test(pattern)) {
-      throw new UnsupportedFilterError(`ilike with a non-ASCII pattern (PocketBase ~ folds case for ASCII only)`);
+  /**
+   * TanStack DB patterns are anchored, `%` and `_` are wildcards and there is no escape character; `like`
+   * is case-sensitive and `ilike` folds case with `toLowerCase()`. PocketBase `~` runs SQLite `LIKE … ESCAPE '\'`,
+   * which folds case for ASCII only, and when the pattern has no `%` it escapes `%` and `_` and wraps it in `%…%`.
+   * The translated pattern always matches a superset: backslashes are escaped, a pattern without `%` is wrapped
+   * here (so `_` stays a wildcard), and for `ilike` every non-ASCII cased letter becomes `%`. Only an `ilike`
+   * pattern that needs none of this is exact.
+   */
+  private likePattern(name: string, pattern: unknown): string {
+    if (typeof pattern !== `string`) {
+      throw new UnsupportedFilterError(`${name} with a non-string pattern`);
     }
-    if (name === `like` || (name === `ilike` && !(typeof pattern === `string` && pattern.includes(`%`)))) {
-      this.exact = false;
+    let exact = name === `ilike`;
+    let value = pattern.replace(/\\/g, `\\\\`);
+    if (name === `ilike`) {
+      const folded = value.replace(/[^\p{ASCII}]/gu, (char) => (char.toLowerCase() === char.toUpperCase() ? char : `%`));
+      exact &&= folded === value;
+      value = folded;
     }
+    if (!value.includes(`%`)) {
+      value = `%${value}%`;
+      exact = false;
+    }
+    this.exact &&= exact;
+    return value;
   }
 }
 
@@ -187,13 +210,101 @@ export function combineFilters(...filters: Array<string | undefined>): string | 
   return present.map((filter) => `(${filter})`).join(` && `);
 }
 
+const encoder = new TextEncoder();
+
+/** Counts the comparisons PocketBase would parse, skipping string literals and comments. */
+function countExpressions(filter: string): number {
+  let count = 0;
+  for (let i = 0; i < filter.length; i++) {
+    const char = filter[i];
+    if (char === `'` || char === `"`) {
+      for (i++; i < filter.length && filter[i] !== char; i++) {
+        if (filter[i] === `\\`) i++;
+      }
+    } else if (char === `/` && filter[i + 1] === `/`) {
+      while (i < filter.length && filter[i] !== `\n`) i++;
+    } else if (char === `=` || char === `~` || char === `<` || char === `>`) {
+      count++;
+      if (filter[i + 1] === `=`) i++;
+    } else if (char === `!` && (filter[i + 1] === `=` || filter[i + 1] === `~`)) {
+      count++;
+      i++;
+    }
+  }
+  return count;
+}
+
+function fitsPocketbaseLimits(filter: string | undefined): boolean {
+  return filter === undefined || (encoder.encode(filter).length <= MAX_FILTER_LENGTH && countExpressions(filter) <= MAX_FILTER_EXPRESSIONS);
+}
+
+function conjuncts(expr: BasicExpression): Array<BasicExpression> {
+  return expr.type === `func` && expr.name === `and` ? expr.args.flatMap(conjuncts) : [expr];
+}
+
+function inListLength(expr: BasicExpression): number {
+  if (expr.type !== `func` || expr.name !== `in`) return 0;
+  const [field, values] = expr.args;
+  return field?.type === `ref` && values?.type === `val` && Array.isArray(values.value) ? values.value.length : 0;
+}
+
+/** Upper bound on the requests one subset may be split into; splitting several lists multiplies their parts. */
+const MAX_SPLIT_REQUESTS = 64;
+
+function withInList(parts: Array<BasicExpression>, index: number, values: Array<unknown>): Array<BasicExpression> {
+  const [field] = (parts[index] as BasicExpression & { args: Array<BasicExpression> }).args;
+  const next = parts.slice();
+  next[index] = { type: `func`, name: `in`, args: [field, { type: `val`, value: values }] } as unknown as BasicExpression;
+  return next;
+}
+
+/**
+ * Halves the longest `in` list among the top-level conjuncts of `where`, recursively, until every filter fits
+ * PocketBase's limits; each recursion picks the longest list again, so several large lists are all split. The
+ * subset is the union of the parts, which only holds for a conjunct: a negated or nested `in` is never split.
+ * Returns undefined, so the request is sent unsplit and PocketBase reports the error, when `where` has no list to
+ * split, when the filter would not fit even with every list reduced to its longest value, or when fitting it
+ * would take more than MAX_SPLIT_REQUESTS requests.
+ */
+function splitInLists(where: BasicExpression, bind: FilterBinder, wrap: (filter: string | undefined) => string | undefined): Array<string | undefined> | undefined {
+  const render = (parts: Array<BasicExpression>) => wrap(compileWhereWithExactness(parts.length === 1 ? (parts[0] as BasicExpression) : ({ type: `func`, name: `and`, args: parts } as unknown as BasicExpression), bind).filter);
+  const valuesOf = (part: BasicExpression) => Array.from(new Set((part as BasicExpression & { args: [BasicExpression, { value: Array<unknown> }] }).args[1].value));
+
+  const parts = conjuncts(where);
+  const lists = parts.flatMap((part, index) => (inListLength(part) > 1 ? [index] : []));
+  if (lists.length === 0) return undefined;
+  const smallest = lists.reduce((reduced, index) => withInList(reduced, index, [valuesOf(parts[index] as BasicExpression).reduce((longest, value) => (String(value).length > String(longest).length ? value : longest))]), parts);
+  if (!fitsPocketbaseLimits(render(smallest))) return undefined;
+
+  const filters: Array<string | undefined> = [];
+  const split = (current: Array<BasicExpression>): boolean => {
+    const filter = render(current);
+    let index = -1;
+    current.forEach((part, i) => {
+      if (inListLength(part) > 1 && (index < 0 || inListLength(part) > inListLength(current[index] as BasicExpression))) {
+        index = i;
+      }
+    });
+    if (index < 0 || fitsPocketbaseLimits(filter)) {
+      filters.push(filter);
+      return filters.length <= MAX_SPLIT_REQUESTS;
+    }
+    const values = valuesOf(current[index] as BasicExpression);
+    const middle = Math.ceil(values.length / 2);
+    return split(withInList(current, index, values.slice(0, middle))) && split(withInList(current, index, values.slice(middle)));
+  };
+  return split(parts) ? filters : undefined;
+}
+
 export interface SubsetRequest {
-  filter?: string;
+  /** One PocketBase filter per request. There are several when a large `in` list was split to stay under PocketBase's filter limits; the subset is the union of their results. */
+  filters: Array<string | undefined>;
   sort?: string;
+  /** Number of records to load from the start of each filter's result; undefined loads them all. */
   perPage?: number;
 }
 
-export function buildSubsetRequest(options: LoadSubsetOptions, baseFilter: string | undefined, baseSort: string | undefined, bind?: FilterBinder): SubsetRequest {
+export function buildSubsetRequest(options: LoadSubsetOptions, baseFilter: string | undefined, baseSort: string | undefined, bind: FilterBinder = defaultBinder): SubsetRequest {
   let exact = true;
   const attempt = <T>(compile: () => T): T | undefined => {
     try {
@@ -207,15 +318,29 @@ export function buildSubsetRequest(options: LoadSubsetOptions, baseFilter: strin
     }
   };
 
-  const compiled = attempt(() => compileWhereWithExactness(options.where, bind ?? defaultBinder));
-  const where = compiled?.filter;
+  const compiled = attempt(() => compileWhereWithExactness(options.where, bind));
   exact &&= compiled?.exact ?? true;
   const sort = attempt(() => compileSort(options.orderBy)) ?? baseSort;
-  const perPage = exact && options.limit !== undefined ? options.limit + (options.offset ?? 0) : undefined;
+  const limited = exact && options.limit !== undefined;
 
-  return {
-    filter: combineFilters(baseFilter, where),
-    sort,
-    perPage,
-  };
+  // The cursor (rows strictly after the last loaded value of the single orderBy column) replaces the offset, so a
+  // page does not reload the rows before it. TanStack DB loads the rows equal to that value with a separate request.
+  let cursor: string | undefined;
+  if (limited && options.cursor) {
+    try {
+      const translated = compileWhereWithExactness(options.cursor.whereFrom, bind);
+      cursor = translated.exact ? translated.filter : undefined;
+    } catch (error) {
+      if (!(error instanceof UnsupportedFilterError)) {
+        throw error;
+      }
+    }
+  }
+  const perPage = limited ? (options.limit as number) + (cursor ? 0 : (options.offset ?? 0)) : undefined;
+
+  const wrap = (where: string | undefined) => combineFilters(baseFilter, where, cursor);
+  const filter = wrap(compiled?.filter);
+  const filters = (!fitsPocketbaseLimits(filter) && compiled && options.where && splitInLists(options.where, bind, wrap)) || [filter];
+
+  return { filters, sort, perPage };
 }

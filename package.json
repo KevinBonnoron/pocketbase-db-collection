@@ -1,6 +1,6 @@
 {
   "name": "pocketbase-db-collection",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pocketbase collection adapter for TanStack DB",
   "type": "module",
   "main": "dist/cjs/index.cjs",
@@ -24,11 +24,11 @@
     "src"
   ],
   "scripts": {
-    "build": "rm -rf dist && mkdir -p dist/esm dist/cjs && bun build src/index.ts --outdir dist/esm --format esm --target browser --minify --sourcemap --bundle && bun build src/index.ts --outdir dist/cjs --format cjs --target node --entry-naming '[dir]/[name].cjs' --minify --sourcemap --bundle && bunx tsc --project tsconfig.build.json && bun -e \"import {readdirSync,copyFileSync} from 'fs';readdirSync('dist/esm').filter(f=>f.endsWith('.d.ts')).forEach(f=>copyFileSync('dist/esm/'+f,'dist/cjs/'+f.replace('.d.ts','.d.cts')))\"",
-    "build:esm": "bun build src/index.ts --outdir dist/esm --format esm --target browser --minify --sourcemap --bundle",
-    "build:cjs": "bun build src/index.ts --outdir dist/cjs --format cjs --target node --entry-naming '[dir]/[name].cjs' --minify --sourcemap --bundle",
+    "build": "rm -rf dist && mkdir -p dist/esm dist/cjs && bun build src/index.ts --outdir dist/esm --format esm --target browser --minify --sourcemap --bundle --packages external && bun build src/index.ts --outdir dist/cjs --format cjs --target node --entry-naming '[dir]/[name].cjs' --minify --sourcemap --bundle --packages external && bunx tsc --project tsconfig.build.json && bun -e \"import {readdirSync,copyFileSync} from 'fs';readdirSync('dist/esm').filter(f=>f.endsWith('.d.ts')).forEach(f=>copyFileSync('dist/esm/'+f,'dist/cjs/'+f.replace('.d.ts','.d.cts')))\"",
+    "build:esm": "bun build src/index.ts --outdir dist/esm --format esm --target browser --minify --sourcemap --bundle --packages external",
+    "build:cjs": "bun build src/index.ts --outdir dist/cjs --format cjs --target node --entry-naming '[dir]/[name].cjs' --minify --sourcemap --bundle --packages external",
     "build:types": "bunx tsc --project tsconfig.build.json",
-    "dev": "bun build src/index.ts --outdir dist/esm --format esm --target browser --watch",
+    "dev": "bun build src/index.ts --outdir dist/esm --format esm --target browser --watch --packages external",
     "test": "bun test",
     "test:coverage": "bun test --coverage",
     "type-check": "bunx tsc --noEmit",

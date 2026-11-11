@@ -1,9 +1,19 @@
 import { describe, expect, it, jest, mock } from 'bun:test';
-import { createCollection, createLiveQueryCollection, eq } from '@tanstack/db';
+import { BasicIndex, createCollection, createLiveQueryCollection, eq } from '@tanstack/db';
 import type { RecordService, RecordSubscription } from 'pocketbase';
-import { buildSubsetRequest, compileSort, compileWhere, pocketbaseCollectionOptions, UnsupportedFilterError } from '../src';
+import { buildSubsetRequest, compileSort, compileWhere, type PocketbaseCollectionUtils, pocketbaseCollectionOptions, UnsupportedFilterError } from '../src';
 
-type Row = { id: string; data: string; updated?: string };
+type Row = { id: string; data: string; updated?: string; created?: string };
+
+/** Evaluates the `field <op> 'value'` comparisons of a filter as a conjunction, enough for the filters these tests emit. */
+function matchesFilter(record: Row, filter: string | undefined): boolean {
+  return Array.from(filter?.matchAll(/(\w+) (=|<|>) '([^']*)'/g) ?? []).every(([, field, operator, value]) => {
+    const actual = String(record[field as keyof Row] ?? ``);
+    return operator === `=` ? actual === value : operator === `<` ? actual < (value as string) : actual > (value as string);
+  });
+}
+
+type ListOptions = { filter?: string; sort?: string };
 
 type Handler = (data: RecordSubscription<Row>) => void;
 
@@ -15,8 +25,19 @@ class FakeRecordService {
   failUnsubscribe = false;
   failFetch = false;
 
-  getFullList = mock((_options?: unknown) => (this.failFetch ? Promise.reject(new Error(`fetch failed`)) : Promise.resolve(Array.from(this.records.values()))));
-  getList = mock((_page: number, perPage: number, _options?: unknown) => Promise.resolve({ items: Array.from(this.records.values()).slice(0, perPage), page: 1, perPage, totalItems: this.records.size, totalPages: 1 }));
+  query(options: ListOptions | undefined): Array<Row> {
+    const rows = Array.from(this.records.values()).filter((record) => matchesFilter(record, options?.filter));
+    const sort = options?.sort;
+    if (sort) {
+      const field = sort.replace(/^-/, ``) as keyof Row;
+      const direction = sort.startsWith(`-`) ? -1 : 1;
+      rows.sort((a, b) => (String(a[field]) < String(b[field]) ? -direction : direction));
+    }
+    return rows;
+  }
+
+  getFullList = mock((options?: ListOptions) => (this.failFetch ? Promise.reject(new Error(`fetch failed`)) : Promise.resolve(this.query(options))));
+  getList = mock((page: number, perPage: number, options?: ListOptions) => Promise.resolve({ items: this.query(options).slice((page - 1) * perPage, page * perPage), page, perPage, totalItems: -1, totalPages: -1 }));
   subscribe = mock((_topic: string, callback: Handler, _options?: unknown) => {
     if (this.failSubscribe) {
       return Promise.reject(new Error(`realtime unavailable`));
@@ -501,6 +522,10 @@ describe(`errors and utils`, () => {
 });
 
 describe(`on-demand sync`, () => {
+  const ref = (...path: Array<string>) => ({ type: `ref`, path });
+  const val = (value: unknown) => ({ type: `val`, value });
+  const fn = (name: string, ...args: Array<unknown>) => ({ type: `func`, name, args });
+
   it(`skips the initial fetch and loads subsets from where clauses`, async () => {
     const svc = service();
     svc.records.set(`a`, { id: `a`, data: `one` });
@@ -508,186 +533,126 @@ describe(`on-demand sync`, () => {
     await collection.stateWhenReady();
     expect(svc.getFullList).toHaveBeenCalledTimes(0);
 
-    const where = {
-      type: `func`,
-      name: `and`,
-      args: [
-        {
-          type: `func`,
-          name: `eq`,
-          args: [
-            { type: `ref`, path: [`row`, `status`] },
-            { type: `val`, value: `CONFIRMED` },
-          ],
-        },
-        {
-          type: `func`,
-          name: `gte`,
-          args: [
-            { type: `ref`, path: [`row`, `datetime`] },
-            { type: `val`, value: new Date(`2026-09-01T00:00:00.000Z`) },
-          ],
-        },
-      ],
-    };
-    const orderBy = [{ expression: { type: `ref`, path: [`row`, `datetime`] }, compareOptions: { direction: `desc` } }];
+    const where = fn(`and`, fn(`eq`, ref(`status`), val(`CONFIRMED`)), fn(`gte`, ref(`datetime`), val(new Date(`2026-09-01T00:00:00.000Z`))));
+    const orderBy = [{ expression: ref(`datetime`), compareOptions: { direction: `desc` } }];
 
     const request = buildSubsetRequest({ where, orderBy, limit: 20 } as never, `organization = 'org1'`, undefined);
-    expect(request.filter).toBe(`(organization = 'org1') && ((status = 'CONFIRMED' && datetime >= '2026-09-01 00:00:00.000Z'))`);
+    expect(request.filters).toEqual([`(organization = 'org1') && ((status = 'CONFIRMED' && datetime >= '2026-09-01 00:00:00.000Z'))`]);
     expect(request.sort).toBe(`-datetime`);
     expect(request.perPage).toBe(20);
   });
 
-  it(`compiles in, not and like`, () => {
-    expect(
-      compileWhere({
-        type: `func`,
-        name: `in`,
-        args: [
-          { type: `ref`, path: [`r`, `status`] },
-          { type: `val`, value: [`A`, `B`] },
-        ],
-      } as never),
-    ).toBe(`(status = 'A' || status = 'B')`);
-    expect(
-      compileWhere({
-        type: `func`,
-        name: `not`,
-        args: [
-          {
-            type: `func`,
-            name: `eq`,
-            args: [
-              { type: `ref`, path: [`r`, `status`] },
-              { type: `val`, value: `A` },
-            ],
-          },
-        ],
-      } as never),
-    ).toBe(`status != 'A'`);
-    expect(
-      compileWhere({
-        type: `func`,
-        name: `like`,
-        args: [
-          { type: `ref`, path: [`r`, `name`] },
-          { type: `val`, value: `Le%` },
-        ],
-      } as never),
-    ).toBe(`name ~ 'Le%'`);
-    expect(
-      compileWhere({
-        type: `func`,
-        name: `eq`,
-        args: [
-          { type: `ref`, path: [`r`, `calendar`, `organization`] },
-          { type: `val`, value: `o'neil` },
-        ],
-      } as never),
-    ).toBe(`calendar.organization = 'o\\'neil'`);
-    expect(compileSort([{ expression: { type: `ref`, path: [`r`, `created`] }, compareOptions: { direction: `asc` } }] as never)).toBe(`created`);
+  it(`compiles in, not, like and nested field paths`, () => {
+    expect(compileWhere(fn(`in`, ref(`status`), val([`A`, `B`, `A`])) as never)).toBe(`(status = 'A' || status = 'B')`);
+    expect(compileWhere(fn(`not`, fn(`eq`, ref(`status`), val(`A`))) as never)).toBe(`status != 'A'`);
+    expect(compileWhere(fn(`like`, ref(`name`), val(`Le%`)) as never)).toBe(`name ~ 'Le%'`);
+    expect(compileWhere(fn(`eq`, ref(`calendar`, `organization`), val(`o'neil`)) as never)).toBe(`calendar.organization = 'o\\'neil'`);
+    expect(compileSort([{ expression: ref(`calendar`, `created`), compareOptions: { direction: `asc` } }] as never)).toBe(`calendar.created`);
   });
 
   it(`falls back to the base filter when the expression is not translatable`, () => {
-    const request = buildSubsetRequest({ where: { type: `func`, name: `coalesce`, args: [] } } as never, `organization = 'org1'`, `-created`);
-    expect(request.filter).toBe(`organization = 'org1'`);
+    const request = buildSubsetRequest({ where: fn(`coalesce`) } as never, `organization = 'org1'`, `-created`);
+    expect(request.filters).toEqual([`organization = 'org1'`]);
     expect(request.sort).toBe(`-created`);
   });
 
   it(`does not translate negated like, since PocketBase !~ is a contains match`, () => {
-    const notLike = {
-      type: `func`,
-      name: `not`,
-      args: [
-        {
-          type: `func`,
-          name: `like`,
-          args: [
-            { type: `ref`, path: [`r`, `name`] },
-            { type: `val`, value: `ab` },
-          ],
-        },
-      ],
-    };
+    const notLike = fn(`not`, fn(`like`, ref(`name`), val(`ab`)));
     expect(() => compileWhere(notLike as never)).toThrow(UnsupportedFilterError);
     const request = buildSubsetRequest({ where: notLike, limit: 10 } as never, `organization = 'org1'`, undefined);
-    expect(request.filter).toBe(`organization = 'org1'`);
+    expect(request.filters).toEqual([`organization = 'org1'`]);
   });
 
   it(`drops perPage when the filter or the sort falls back, so the client never filters a truncated page`, () => {
-    const unsupportedWhere = { type: `func`, name: `coalesce`, args: [] };
-    const unsupportedOrderBy = [{ expression: { type: `func`, name: `lower`, args: [{ type: `ref`, path: [`r`, `name`] }] }, compareOptions: { direction: `asc` } }];
-    const supportedWhere = {
-      type: `func`,
-      name: `eq`,
-      args: [
-        { type: `ref`, path: [`r`, `status`] },
-        { type: `val`, value: `A` },
-      ],
-    };
+    const unsupportedOrderBy = [{ expression: fn(`lower`, ref(`name`)), compareOptions: { direction: `asc` } }];
+    const supportedWhere = fn(`eq`, ref(`status`), val(`A`));
 
-    expect(buildSubsetRequest({ where: unsupportedWhere, limit: 10 } as never, undefined, undefined).perPage).toBeUndefined();
+    expect(buildSubsetRequest({ where: fn(`coalesce`), limit: 10 } as never, undefined, undefined).perPage).toBeUndefined();
     expect(buildSubsetRequest({ where: supportedWhere, orderBy: unsupportedOrderBy, limit: 10 } as never, undefined, undefined).perPage).toBeUndefined();
     expect(buildSubsetRequest({ where: supportedWhere, limit: 10, offset: 5 } as never, undefined, undefined).perPage).toBe(15);
   });
 
-  it(`drops perPage for like and for ilike without a wildcard, since PocketBase ~ is case-insensitive and auto-wraps`, () => {
-    const pattern = (name: string, value: string) => ({
-      type: `func`,
-      name,
-      args: [
-        { type: `ref`, path: [`r`, `name`] },
-        { type: `val`, value },
-      ],
-    });
+  it(`translates like and ilike into PocketBase patterns that match a superset, exact only for ASCII ilike with a wildcard`, () => {
+    const request = (name: string, value: string) => buildSubsetRequest({ where: fn(name, ref(`name`), val(value)), limit: 10 } as never, undefined, undefined);
 
-    expect(buildSubsetRequest({ where: pattern(`like`, `Le%`), limit: 10 } as never, undefined, undefined)).toEqual({ filter: `name ~ 'Le%'`, sort: undefined, perPage: undefined });
-    expect(buildSubsetRequest({ where: pattern(`ilike`, `ab`), limit: 10 } as never, undefined, undefined)).toEqual({ filter: `name ~ 'ab'`, sort: undefined, perPage: undefined });
-    expect(buildSubsetRequest({ where: pattern(`ilike`, `%ab%`), limit: 10 } as never, undefined, undefined)).toEqual({ filter: `name ~ '%ab%'`, sort: undefined, perPage: 10 });
+    expect(request(`like`, `Le%`)).toEqual({ filters: [`name ~ 'Le%'`], sort: undefined, perPage: undefined });
+    expect(request(`ilike`, `%ab%`)).toEqual({ filters: [`name ~ '%ab%'`], sort: undefined, perPage: 10 });
+    // Without `%`, PocketBase would escape `_` into a literal; wrapping keeps it a wildcard like in TanStack DB
+    expect(request(`ilike`, `a_c`)).toEqual({ filters: [`name ~ '%a_c%'`], sort: undefined, perPage: undefined });
+    // PocketBase uses `\` as the LIKE escape character, TanStack DB has none
+    expect(request(`ilike`, `a\\b%`).filters).toEqual([`name ~ 'a\\\\\\\\b%'`]);
+    // SQLite LIKE folds case for ASCII only, so a non-ASCII cased letter becomes a wildcard
+    expect(request(`ilike`, `école%`)).toEqual({ filters: [`name ~ '%cole%'`], sort: undefined, perPage: undefined });
+    expect(request(`ilike`, `東京%`)).toEqual({ filters: [`name ~ '東京%'`], sort: undefined, perPage: 10 });
   });
 
   it(`does not translate like or ilike when the field is the pattern`, () => {
     for (const name of [`like`, `ilike`]) {
-      const where = {
-        type: `func`,
-        name,
-        args: [
-          { type: `val`, value: `abc` },
-          { type: `ref`, path: [`r`, `name`] },
-        ],
-      };
+      const where = fn(name, val(`abc`), ref(`name`));
       expect(() => compileWhere(where as never)).toThrow(UnsupportedFilterError);
-      expect(buildSubsetRequest({ where, limit: 10 } as never, `organization = 'org1'`, undefined)).toEqual({ filter: `organization = 'org1'`, sort: undefined, perPage: undefined });
+      expect(buildSubsetRequest({ where, limit: 10 } as never, `organization = 'org1'`, undefined)).toEqual({ filters: [`organization = 'org1'`], sort: undefined, perPage: undefined });
     }
-    expect(
-      compileWhere({
-        type: `func`,
-        name: `gt`,
-        args: [
-          { type: `val`, value: 3 },
-          { type: `ref`, path: [`r`, `count`] },
-        ],
-      } as never),
-    ).toBe(`count < 3`);
-  });
-
-  it(`does not translate ilike with a non-ASCII pattern, since PocketBase ~ folds case for ASCII only`, () => {
-    const where = {
-      type: `func`,
-      name: `ilike`,
-      args: [
-        { type: `ref`, path: [`r`, `name`] },
-        { type: `val`, value: `école%` },
-      ],
-    };
-    expect(() => compileWhere(where as never)).toThrow(UnsupportedFilterError);
-    expect(buildSubsetRequest({ where, limit: 10 } as never, `organization = 'org1'`, undefined)).toEqual({ filter: `organization = 'org1'`, sort: undefined, perPage: undefined });
+    expect(compileWhere(fn(`gt`, val(3), ref(`count`)) as never)).toBe(`count < 3`);
   });
 
   it(`falls back to the base sort when the ordering is not translatable`, () => {
-    const orderBy = [{ expression: { type: `func`, name: `lower`, args: [{ type: `ref`, path: [`r`, `name`] }] }, compareOptions: { direction: `asc` } }];
-    const request = buildSubsetRequest({ orderBy } as never, undefined, `-created`);
+    const request = buildSubsetRequest({ orderBy: [{ expression: fn(`lower`, ref(`name`)), compareOptions: { direction: `asc` } }] } as never, undefined, `-created`);
     expect(request.sort).toBe(`-created`);
+  });
+
+  it(`replaces the offset with the cursor, and keeps the offset when the cursor is not translatable`, () => {
+    const orderBy = [{ expression: ref(`created`), compareOptions: { direction: `desc`, nulls: `last` } }];
+    const cursor = { whereFrom: fn(`lt`, ref(`created`), val(`2026-01-02`)), whereCurrent: fn(`eq`, ref(`created`), val(`2026-01-02`)) };
+    expect(buildSubsetRequest({ orderBy, limit: 10, offset: 30, cursor } as never, `a = 1`, undefined)).toEqual({ filters: [`(a = 1) && (created < '2026-01-02')`], sort: `-created`, perPage: 10 });
+
+    const nullsLast = { ...cursor, whereFrom: fn(`or`, fn(`lt`, ref(`created`), val(`2026-01-02`)), fn(`isNull`, ref(`created`))) };
+    expect(buildSubsetRequest({ orderBy, limit: 10, offset: 30, cursor: nullsLast } as never, `a = 1`, undefined)).toEqual({ filters: [`a = 1`], sort: `-created`, perPage: 40 });
+  });
+
+  it(`splits a large in list so every filter fits PocketBase's length and expression limits`, () => {
+    const ids = Array.from({ length: 500 }, (_, i) => `id${String(i).padStart(13, `0`)}`);
+    const where = fn(`and`, fn(`eq`, ref(`status`), val(`A`)), fn(`in`, ref(`id`), val([...ids, ids[0]])));
+    const { filters } = buildSubsetRequest({ where } as never, `organization = 'org1'`, undefined);
+
+    expect(filters.length).toBeGreaterThan(1);
+    const loaded: Array<string> = [];
+    for (const filter of filters as Array<string>) {
+      expect(new TextEncoder().encode(filter).length).toBeLessThanOrEqual(3500);
+      expect(filter.match(/ = /g)?.length ?? 0).toBeLessThanOrEqual(200);
+      expect(filter.startsWith(`(organization = 'org1') && ((status = 'A' && (`)).toBe(true);
+      loaded.push(...Array.from(filter.matchAll(/id = '(\w+)'/g), (match) => match[1] as string));
+    }
+    expect(loaded.sort()).toEqual(ids);
+
+    // A negated list is not a union of its parts
+    expect(buildSubsetRequest({ where: fn(`not`, fn(`in`, ref(`id`), val(ids))) } as never, undefined, undefined).filters).toHaveLength(1);
+  });
+
+  it(`splits every oversized in list, so two large lists still produce filters within the limits`, () => {
+    const ids = (prefix: string) => Array.from({ length: 250 }, (_, i) => `${prefix}${String(i).padStart(13, `0`)}`);
+    const [owners, tags] = [ids(`o`), ids(`t`)];
+    const { filters } = buildSubsetRequest({ where: fn(`and`, fn(`in`, ref(`owner`), val(owners)), fn(`in`, ref(`tag`), val(tags))) } as never, undefined, undefined);
+
+    const pairs = new Set<string>();
+    for (const filter of filters as Array<string>) {
+      expect(new TextEncoder().encode(filter).length).toBeLessThanOrEqual(3500);
+      expect(filter.match(/ = /g)?.length ?? 0).toBeLessThanOrEqual(200);
+      const values = (field: string) => Array.from(filter.matchAll(new RegExp(`${field} = '(\\w+)'`, `g`)), (match) => match[1]);
+      for (const owner of values(`owner`)) {
+        for (const tag of values(`tag`)) pairs.add(`${owner}/${tag}`);
+      }
+    }
+    expect(pairs.size).toBe(owners.length * tags.length);
+  });
+
+  it(`does not split when it cannot help or would take too many requests, and sends the filter for PocketBase to reject`, () => {
+    const ids = (prefix: string, length: number) => Array.from({ length }, (_, i) => `${prefix}${String(i).padStart(13, `0`)}`);
+    const twoLists = (length: number) => fn(`and`, fn(`in`, ref(`owner`), val(ids(`o`, length))), fn(`in`, ref(`tag`), val(ids(`t`, length))));
+
+    // Even single values exceed the limit next to this base filter: no split, instead of 62,500 invalid filters
+    expect(buildSubsetRequest({ where: twoLists(250) } as never, `note = '${`x`.repeat(3480)}'`, undefined).filters).toHaveLength(1);
+    // Two lists of 2000 values would multiply into hundreds of requests
+    expect(buildSubsetRequest({ where: twoLists(2000) } as never, undefined, undefined).filters).toHaveLength(1);
   });
 });
 
@@ -736,17 +701,29 @@ describe(`loadSubset requests`, () => {
   function startOnDemand(svc: FakeRecordService, extra: Record<string, unknown> = {}) {
     const options = pocketbaseCollectionOptions({ recordService: svc as unknown as RecordService<Row>, syncMode: `on-demand`, ...extra });
     const collection = { config: { syncMode: `on-demand` } };
+    const sync = { begin: mock(() => {}), write: mock((_message: WriteMessage) => {}), commit: mock(() => true as never), truncate: mock(() => {}) };
     const result = options.sync.sync({
       collection: collection as never,
-      begin: mock(() => {}),
-      write: mock(() => {}),
-      commit: mock(() => true as never),
+      ...sync,
       markReady: mock(() => {}),
       markError: mock(() => {}),
-      truncate: mock(() => {}),
     });
-    return result as { loadSubset: (subset: Record<string, unknown>) => true | Promise<void>; cleanup: () => void };
+    type Subset = Record<string, unknown>;
+    return { ...(result as { loadSubset: (subset: Subset) => true | Promise<void>; unloadSubset: (subset: Subset) => void; cleanup: () => void }), sync, refetch: (options.utils as PocketbaseCollectionUtils).refetch };
   }
+
+  type WriteMessage = { type: string; value?: Row; key?: string };
+  const whereData = (value: string) => ({
+    where: {
+      type: `func`,
+      name: `eq`,
+      args: [
+        { type: `ref`, path: [`data`] },
+        { type: `val`, value },
+      ],
+    },
+  });
+  const writesOf = (write: { mock: { calls: Array<[WriteMessage]> } }, key: string) => write.mock.calls.map(([message]) => message).filter((message) => (message.value?.id ?? message.key) === key);
 
   it(`skips the request when the signal is already aborted`, async () => {
     const svc = service();
@@ -803,7 +780,7 @@ describe(`loadSubset requests`, () => {
         type: `func`,
         name: `eq`,
         args: [
-          { type: `ref`, path: [`r`, `status`] },
+          { type: `ref`, path: [`status`] },
           { type: `val`, value: `CONFIRMED` },
         ],
       },
@@ -839,6 +816,94 @@ describe(`loadSubset requests`, () => {
     expect(svc.subscribe).toHaveBeenCalledTimes(1);
     expect(svc.handlers).toHaveLength(0);
   });
+
+  it(`loads more than PocketBase's 1000-record page cap in successive pages`, async () => {
+    const svc = service();
+    for (let i = 0; i < 2500; i++) {
+      svc.records.set(`r${i}`, { id: `r${i}`, data: `x` });
+    }
+    const { loadSubset, cleanup, sync } = startOnDemand(svc);
+
+    await loadSubset({ limit: 2100 });
+    expect(svc.getList.mock.calls.map(([page, perPage, options]) => [page, perPage, (options as { skipTotal?: boolean }).skipTotal])).toEqual([
+      [1, 1000, true],
+      [2, 1000, true],
+      [3, 1000, true],
+    ]);
+    expect(sync.write).toHaveBeenCalledTimes(2100);
+    cleanup();
+  });
+
+  it(`loads a split in list with one request per part and commits the union once`, async () => {
+    const svc = service();
+    const ids = Array.from({ length: 300 }, (_, i) => `id${String(i).padStart(13, `0`)}`);
+    for (const id of ids.slice(0, 250)) {
+      svc.records.set(id, { id, data: `x` });
+    }
+    svc.getFullList.mockImplementation((options?: ListOptions) => Promise.resolve(Array.from(options?.filter?.matchAll(/id = '(\w+)'/g) ?? [], ([, id]) => svc.records.get(id as string)).filter((row): row is Row => row !== undefined)));
+    const { loadSubset, cleanup, sync } = startOnDemand(svc);
+
+    await loadSubset({
+      where: {
+        type: `func`,
+        name: `in`,
+        args: [
+          { type: `ref`, path: [`id`] },
+          { type: `val`, value: ids },
+        ],
+      },
+    });
+    expect(svc.getFullList.mock.calls.length).toBeGreaterThan(1);
+    expect(sync.begin).toHaveBeenCalledTimes(1);
+    expect(sync.commit).toHaveBeenCalledTimes(1);
+    expect(sync.write.mock.calls.map(([message]) => message.value?.id).sort()).toEqual(ids.slice(0, 250));
+    cleanup();
+  });
+
+  it(`does not let an earlier load's commit override a later load's response`, async () => {
+    const svc = service();
+    const [older, newer] = [Promise.withResolvers<Array<Row>>(), Promise.withResolvers<Array<Row>>()];
+    svc.getFullList.mockImplementationOnce(() => older.promise).mockImplementationOnce(() => newer.promise);
+    const { loadSubset, cleanup, sync } = startOnDemand(svc);
+
+    const first = loadSubset(whereData(`open`));
+    const second = loadSubset({});
+    older.resolve([{ id: `a`, data: `open`, updated: `1` }]);
+    await first;
+    newer.resolve([{ id: `a`, data: `open`, updated: `2` }]);
+    await second;
+
+    expect(writesOf(sync.write, `a`).at(-1)?.value?.updated).toBe(`2`);
+    cleanup();
+  });
+
+  it(`does not restore the rows of a subset released while an older refetch was in flight`, async () => {
+    const svc = service();
+    svc.records.set(`a1`, { id: `a1`, data: `a` });
+    svc.records.set(`b1`, { id: `b1`, data: `b` });
+    const { loadSubset, unloadSubset, cleanup, sync, refetch } = startOnDemand(svc);
+    const [subsetA, subsetB] = [whereData(`a`), whereData(`b`)];
+    await loadSubset(subsetA);
+    await loadSubset(subsetB);
+
+    const [slowA, slowB] = [Promise.withResolvers<Array<Row>>(), Promise.withResolvers<Array<Row>>()];
+    svc.getFullList.mockImplementationOnce(() => slowA.promise).mockImplementationOnce(() => slowB.promise);
+    const olderRefetch = refetch();
+    unloadSubset(subsetB);
+    await refetch();
+    expect(writesOf(sync.write, `b1`).at(-1)?.type).toBe(`delete`);
+
+    // A row created on the server for the released subset must not be installed either
+    slowA.resolve([{ id: `a1`, data: `a` }]);
+    slowB.resolve([
+      { id: `b1`, data: `b` },
+      { id: `b2`, data: `b` },
+    ]);
+    await olderRefetch;
+    expect(writesOf(sync.write, `b1`).at(-1)?.type).toBe(`delete`);
+    expect(writesOf(sync.write, `b2`)).toEqual([]);
+    cleanup();
+  });
 });
 
 describe('live queries', () => {
@@ -850,5 +915,245 @@ describe('live queries', () => {
     const openRows = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, 'open')));
     await openRows.preload();
     expect(openRows.toArray.map(({ id }) => id)).toEqual(['a1']);
+  });
+});
+
+describe(`on-demand live queries`, () => {
+  const onDemand = (svc: FakeRecordService, extra: Record<string, unknown> = {}) => collectionFor(svc, { syncMode: `on-demand`, autoIndex: `eager`, defaultIndexType: BasicIndex, ...extra });
+
+  it(`loads the next pages after the cursor instead of reloading the previous ones`, async () => {
+    const svc = service();
+    for (let i = 0; i < 100; i++) {
+      const id = `r${String(i).padStart(3, `0`)}`;
+      svc.records.set(id, { id, data: `x`, created: `2026-01-01 00:${String(Math.floor(i / 60)).padStart(2, `0`)}:${String(i % 60).padStart(2, `0`)}.000Z` });
+    }
+    const rows = onDemand(svc);
+    const latest = createLiveQueryCollection((q) =>
+      q
+        .from({ row: rows })
+        .orderBy(({ row }) => row.created, `desc`)
+        .limit(10),
+    );
+    await latest.preload();
+    for (const limit of [20, 30]) {
+      await latest.utils.setWindow({ offset: 0, limit });
+      await tick();
+    }
+
+    expect(latest.toArray.map(({ id }) => id)).toEqual(Array.from({ length: 30 }, (_, i) => `r${String(99 - i).padStart(3, `0`)}`));
+    // Each page asks for 10 rows after the cursor; TanStack DB loads the rows equal to the cursor separately
+    expect(svc.getList.mock.calls.map(([page, perPage]) => [page, perPage])).toEqual([
+      [1, 10],
+      [1, 10],
+      [1, 10],
+    ]);
+    expect(svc.getFullList.mock.calls.every(([options]) => options?.filter?.startsWith(`created = `))).toBe(true);
+    expect(rows.size).toBe(30);
+  });
+
+  it(`refetch reloads the subsets of active live queries instead of the whole collection`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `open` });
+    svc.records.set(`b`, { id: `b`, data: `closed` });
+    const rows = onDemand(svc);
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    await open.preload();
+    expect(rows.get(`a`)).toBeDefined();
+
+    svc.records.delete(`a`);
+    svc.records.set(`c`, { id: `c`, data: `open` });
+    await rows.utils.refetch();
+
+    expect(rows.get(`a`)).toBeUndefined();
+    expect(rows.get(`c`)?.data).toBe(`open`);
+    expect(rows.get(`b`)).toBeUndefined();
+    expect(svc.getFullList.mock.calls.map(([options]) => options?.filter)).toEqual([`data = 'open'`, `data = 'open'`]);
+  });
+
+  it(`refetch keeps an ordered, limited query bounded instead of loading the full source`, async () => {
+    const svc = service();
+    for (let i = 0; i < 50; i++) {
+      const id = `r${String(i).padStart(3, `0`)}`;
+      svc.records.set(id, { id, data: `x`, created: `2026-01-01 00:00:${String(i).padStart(2, `0`)}.000Z` });
+    }
+    const rows = onDemand(svc);
+    const latest = createLiveQueryCollection((q) =>
+      q
+        .from({ row: rows })
+        .orderBy(({ row }) => row.created, `desc`)
+        .limit(10),
+    );
+    await latest.preload();
+    svc.records.set(`r049`, { ...(svc.records.get(`r049`) as Row), data: `changed` });
+    svc.getList.mockClear();
+    svc.getFullList.mockClear();
+
+    await rows.utils.refetch();
+    await tick();
+
+    // Only the active subsets are replayed: the first page and the rows equal to its boundary
+    expect(svc.getList.mock.calls.map(([page, perPage, options]) => [page, perPage, options?.filter])).toEqual([[1, 10, undefined]]);
+    expect(svc.getFullList.mock.calls.map(([options]) => options?.filter)).toEqual([`created = '2026-01-01 00:00:40.000Z'`]);
+    expect(latest.toArray[0]?.data).toBe(`changed`);
+    expect(rows.size).toBe(10);
+  });
+
+  it(`does not write back a row deleted while its load was in flight`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `open` });
+    const response = Promise.withResolvers<Array<Row>>();
+    svc.getFullList.mockImplementationOnce(() => response.promise);
+    const rows = onDemand(svc);
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    const loading = open.preload();
+    await tick();
+
+    svc.emit(`delete`, { id: `a`, data: `open` });
+    await tick();
+    response.resolve([{ id: `a`, data: `open` }]);
+    await loading;
+    await tick();
+
+    expect(rows.get(`a`)).toBeUndefined();
+  });
+
+  it(`with realtimeScope 'loaded', applies an update received while the load that returns the row was in flight`, async () => {
+    const svc = service();
+    const response = Promise.withResolvers<Array<Row>>();
+    svc.getFullList.mockImplementationOnce(() => response.promise);
+    const rows = onDemand(svc, { realtimeScope: `loaded` });
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    const loading = open.preload();
+    await tick();
+
+    // Dropped by the realtime filter: the key is not loaded yet and the new value does not match the subset
+    svc.emit(`update`, { id: `a`, data: `closed` });
+    await tick();
+    response.resolve([{ id: `a`, data: `open` }]);
+    await loading;
+    await tick();
+
+    expect(rows.get(`a`)?.data).toBe(`closed`);
+    expect(open.toArray).toEqual([]);
+  });
+
+  it(`does not let a load that started before a refetch overwrite the refetched state`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `open` });
+    svc.records.set(`b`, { id: `b`, data: `open`, updated: `1` });
+    const stale = Promise.withResolvers<Array<Row>>();
+    svc.getFullList.mockImplementationOnce(() => stale.promise);
+    const rows = onDemand(svc);
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    const loading = open.preload();
+    await tick();
+
+    // Changes missed by realtime, repaired by the refetch while the first load is still in flight
+    svc.records.delete(`a`);
+    svc.records.set(`b`, { id: `b`, data: `open`, updated: `2` });
+    await rows.utils.refetch();
+    stale.resolve([
+      { id: `a`, data: `open` },
+      { id: `b`, data: `open`, updated: `1` },
+    ]);
+    await loading;
+    await tick();
+
+    expect(rows.get(`a`)).toBeUndefined();
+    expect(rows.get(`b`)?.updated).toBe(`2`);
+  });
+
+  it(`applies every realtime event by default`, async () => {
+    const svc = service();
+    const rows = onDemand(svc);
+    await rows.stateWhenReady();
+    svc.emit(`create`, { id: `x`, data: `anything` });
+    await tick();
+    expect(rows.get(`x`)).toBeDefined();
+  });
+
+  it(`with realtimeScope 'loaded', applies only the events of loaded records or of records matching an active subset`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `open` });
+    const rows = onDemand(svc, { realtimeScope: `loaded` });
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    await open.preload();
+
+    svc.emit(`create`, { id: `closed`, data: `closed` });
+    svc.emit(`create`, { id: `new`, data: `open` });
+    svc.emit(`update`, { id: `a`, data: `closed` });
+    await tick();
+    expect(rows.get(`closed`)).toBeUndefined();
+    expect(rows.get(`new`)?.data).toBe(`open`);
+    expect(rows.get(`a`)?.data).toBe(`closed`);
+
+    // The server response of a local write is applied even outside every subset, so the optimistic row settles
+    const id = rows.utils.newId();
+    await rows.insert({ id, data: `draft` }).isPersisted.promise;
+    await tick();
+    expect((rows.get(id) as { $synced?: boolean } | undefined)?.$synced).toBe(true);
+
+    await open.cleanup();
+    svc.emit(`create`, { id: `late`, data: `open` });
+    await tick();
+    expect(rows.get(`late`)).toBeUndefined();
+  });
+
+  it(`does not let an event buffered before a load restore its older value after the load commits`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `open`, updated: `2` });
+    const rows = onDemand(svc, { batchDelay: 30 });
+    await rows.stateWhenReady();
+    svc.emit(`update`, { id: `a`, data: `open`, updated: `1` });
+
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    await open.preload();
+    await sleep(60);
+
+    expect(rows.get(`a`)?.updated).toBe(`2`);
+  });
+
+  for (const [label, responseDelay] of [
+    [`before the buffer flushes`, 0],
+    [`after the buffer flushed during the requests`, 60],
+  ] as const) {
+    it(`refetch drops an upsert buffered before it for a row no active subset returns, when it answers ${label}`, async () => {
+      const svc = service();
+      svc.records.set(`a`, { id: `a`, data: `open` });
+      const rows = onDemand(svc, { batchDelay: 30 });
+      const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+      await open.preload();
+
+      // Created then deleted on the server; the delete event was missed and the refetch repairs it
+      svc.emit(`create`, { id: `x`, data: `open` });
+      svc.getFullList.mockImplementationOnce(async (options?: ListOptions) => {
+        await sleep(responseDelay);
+        return svc.query(options);
+      });
+      await rows.utils.refetch();
+      await sleep(60);
+
+      expect(rows.get(`x`)).toBeUndefined();
+      expect(open.toArray.map(({ id }) => id)).toEqual([`a`]);
+    });
+  }
+
+  it(`still settles the optimistic row of a mutation whose buffered response a refetch drops`, async () => {
+    const svc = service();
+    svc.echoRealtime = false;
+    svc.records.set(`a`, { id: `a`, data: `open` });
+    const rows = onDemand(svc, { batchDelay: 30 });
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    await open.preload();
+
+    const id = rows.utils.newId();
+    const tx = rows.insert({ id, data: `draft` });
+    await tx.isPersisted.promise;
+    await rows.utils.refetch();
+    await sleep(60);
+
+    // The draft matches no active subset, so the refetch removes it like any uncovered row, without leaving it optimistic
+    expect(rows.get(id)).toBeUndefined();
+    expect(rows.size).toBe(1);
   });
 });

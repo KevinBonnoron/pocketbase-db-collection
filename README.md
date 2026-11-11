@@ -124,7 +124,21 @@ useLiveQuery((q) =>
 )
 ```
 
-Supported operators: `eq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in`, `and`, `or`, and `not` on `eq` and `in` (a negated `like` cannot be expressed with PocketBase's `!~` contains operator). Field references may be nested (`calendar.organization`). Expressions that cannot be translated fall back to the base filter, which loads a superset that the live query then filters locally. `perPage` is only sent when the PocketBase filter is exact: `like` (case-sensitive in TanStack DB, not in PocketBase) and `ilike` without a `%` wildcard (PocketBase turns it into a contains match) load the full superset instead. Values are bound with `pb.filter()` when the record service exposes its client.
+Supported operators: `eq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in`, `and`, `or`, and `not` on `eq` and `in` (a negated `like` cannot be expressed with PocketBase's `!~` contains operator). Field references may be nested (`calendar.organization`). Expressions that cannot be translated fall back to the base filter, which loads a superset that the live query then filters locally. Values are bound with `pb.filter()` when the record service exposes its client.
+
+`like` and `ilike` patterns are translated so the server always returns a superset of what TanStack DB matches: backslashes are escaped, a pattern without `%` is wrapped in `%…%` (PocketBase would otherwise escape `_`, a wildcard in TanStack DB), and for `ilike` every non-ASCII letter becomes `%`, since SQLite `LIKE` folds case for ASCII only. A page size is only sent when the filter is exact, which means an `ilike` with a `%` and ASCII-only letters; any other `like`/`ilike` loads the whole filtered superset.
+
+Paging: an ordered, limited live query on a single column loads its first page with `getList(1, limit)` and every following page with the rows after the last loaded value (`created < '…'`) instead of reloading the previous pages; TanStack DB loads the rows equal to that value with a second request. Ordering on several columns has no cursor and reloads the prefix. Pages larger than 1000 records (PocketBase's `perPage` cap) are loaded in successive requests, all with `skipTotal`.
+
+An `in` list too long for PocketBase's filter limits (3500 bytes, 200 comparisons) is split into several requests whose results are committed together, as long as the `in` is a top-level conjunct of the `where`.
+
+The collection defaults `defaultStringCollation` to `{ stringSort: 'lexical' }`, to match the byte order SQLite uses. TanStack DB otherwise sorts strings by locale and, since it cannot express a locale order as a cursor, loads the full source for every ordered query on a text or date field. Override it if you need locale ordering in the UI. The match is exact for ids, dates and any text below U+E000; JavaScript compares UTF-16 code units and SQLite compares UTF-8 bytes, so an ordered, limited query on a field mixing characters above U+FFFF (emoji) with characters in U+E000–U+FFFF (full-width forms, private use) can page differently from the server. Order such a field with `{ stringSort: 'locale' }` in the query's `orderBy` options: that query then loads its whole filtered source.
+
+By default every realtime create/update the user can see is applied, so new records show up in live queries but the collection keeps growing with every write on the server. Set `realtimeScope: 'loaded'` to only apply events for records already in the collection or matching the `where` of a subset loaded by an active live query; deletes and the responses of local mutations are always applied.
+
+A load response never overwrites a newer state: a realtime event or mutation response received while a load was in flight wins over the row the load returns, and a row deleted meanwhile is not written back. Likewise a load that started later (such as a refetch) wins over one that started earlier, an event still buffered from before a load cannot restore its older value for a key the load returned, and a subset released while its load was in flight installs nothing. An on-demand refetch also drops buffered events from before it for rows no active subset returns, consistent with removing those rows from the synced state.
+
+TanStack DB 0.9 itself loads the full source of an ordered, limited live query when a row of its window is deleted or changes its sort value, since the window's cursor no longer holds.
 
 ### With a Standard Schema
 
@@ -157,7 +171,7 @@ pb.authStore.onChange(() => {
 })
 ```
 
-`await todos.utils.refetch()` replaces the synced state with a fresh `getFullList()` without restarting the subscription. TanStack DB shares `utils` between every collection created from the same options object, so all of them are refetched.
+`await todos.utils.refetch()` replaces the synced state with the server state without restarting the subscription. An eager collection re-runs `getFullList()`. An on-demand collection reloads the subsets of its active live queries and commits them at once; rows that no subset returns any more are removed. TanStack DB shares `utils` between every collection created from the same options object, so all of them are refetched.
 
 ## API
 
@@ -173,6 +187,8 @@ Returns a `CollectionConfig` for TanStack DB's `createCollection()`.
 | `batchDelay` | `number` | Optional, default `0`. Milliseconds to buffer realtime events and mutation responses before committing them together. Raise it to fold longer bursts into fewer commits. |
 | `schema` | `StandardSchemaV1` | Optional. Validates mutations and types records. |
 | `syncMode` | `'eager' \| 'on-demand'` | Optional, TanStack DB option. `on-demand` skips the initial fetch and loads from live queries. |
+| `realtimeScope` | `'all' \| 'loaded'` | Optional, default `all`. On-demand only: `loaded` drops realtime create/update events for records that are neither loaded nor matched by an active live query. |
+| `defaultStringCollation` | `StringCollationConfig` | Optional, default `{ stringSort: 'lexical' }` to match SQLite. |
 | Other | — | Any other `BaseCollectionConfig` field (`id`, `gcTime`, `startSync`, `autoIndex`, `compare`, …) is forwarded as-is. |
 
 The returned config sets `getKey` to the record id, registers the sync function (subscribe, then initial fetch or `loadSubset`), the `onInsert` / `onUpdate` / `onDelete` handlers, and `utils`:
@@ -184,7 +200,7 @@ The returned config sets `getKey` to the record id, registers the sync function 
 
 ### Filter helpers
 
-`compileWhere`, `compileSort`, `combineFilters` and `buildSubsetRequest` are exported for adapters that need to translate TanStack DB expressions to PocketBase filters themselves.
+`compileWhere`, `compileSort`, `combineFilters` and `buildSubsetRequest` are exported for adapters that need to translate TanStack DB expressions to PocketBase filters themselves. `buildSubsetRequest` returns `filters` (one per request, several when an `in` list was split), `sort` and `perPage`.
 
 ## Development
 
