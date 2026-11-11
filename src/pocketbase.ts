@@ -162,7 +162,8 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
        * a delete that must drop a retained optimistic row the snapshot does not contain.
        */
       const pending = new Map<string, { seq: number; event: SyncEvent<TItem> }>();
-      let sequence = 0;
+      /** Orders realtime events, mutation responses and load starts: each takes the next value when it happens. */
+      let clock = 0;
       let flushTimer: ReturnType<typeof setTimeout> | undefined;
       let refetchGeneration = 0;
       let newestRefetchPending = false;
@@ -197,7 +198,7 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
         commit();
       };
 
-      const enqueue = (event: SyncEvent<TItem>) => {
+      const enqueue = (event: SyncEvent<TItem>, stamp: number) => {
         if (!active) return;
         const key = event.type === `upsert` ? getKey(event.item) : event.key;
         if (event.type === `delete`) {
@@ -207,7 +208,7 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
             event = { ...event, unsynced };
           }
         }
-        pending.set(key, { seq: ++sequence, event });
+        pending.set(key, { seq: stamp, event });
         scheduleFlush();
       };
 
@@ -232,15 +233,15 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
 
       /**
        * A load response can be older than what the collection learned while it was in flight: a realtime event or a
-       * mutation response, or the result of a load that started later (a refetch repairing a missed change). While
-       * loads are in flight, the newest known state per key is recorded with a sequence number: events take the next
-       * number when received (before `realtimeScope` filtering, which may drop them), and a committed load records
-       * every row it wrote or deleted just after its own start, so loads started earlier defer to it while events
-       * received during it still win. Each load replaces the records changed after it started with the recorded
-       * value, or drops the deleted ones.
+       * mutation response, or the result of a load that started later (a refetch repairing a missed change). Events
+       * and load starts take the next `clock` value. While loads are in flight, the newest known state per key is
+       * recorded with its stamp: an event's arrival (before `realtimeScope` filtering, which may drop it), or the
+       * start of a committed load for every row that load wrote or deleted. Each load replaces the records whose
+       * recorded state is newer than its own start, or drops the deleted ones. A committed load also rewrites the
+       * buffered events older than its start for the keys it wrote, so the next flush cannot restore them; they stay
+       * buffered because a mutation response must still reach TanStack DB to settle its optimistic row.
        */
       const observed = new Map<string, { seq: number; event: SyncEvent<TItem> }>();
-      let observedSequence = 0;
       let loadsInFlight = 0;
 
       const record = (key: string, event: SyncEvent<TItem>, seq: number) => {
@@ -248,40 +249,53 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
         if (!latest || latest.seq < seq) observed.set(key, { seq, event });
       };
 
+      /** Stamps an event received from PocketBase and records it for the loads in flight. */
       const observe = (event: SyncEvent<TItem>) => {
-        if (loadsInFlight === 0) return;
-        record(event.type === `upsert` ? getKey(event.item) : event.key, event, ++observedSequence);
+        const stamp = ++clock;
+        if (loadsInFlight > 0) record(event.type === `upsert` ? getKey(event.item) : event.key, event, stamp);
+        return stamp;
       };
 
       const startLoad = () => {
         loadsInFlight++;
-        return observedSequence;
-      };
-
-      /** Records what a committed load wrote, ordered after its start but before any event received during it. */
-      const recordLoad = (records: Map<string, TItem>, removed: Array<string>, since: number) => {
-        if (loadsInFlight <= 1) return;
-        const seq = since + 0.5;
-        for (const [key, item] of records) record(key, { type: `upsert`, item }, seq);
-        for (const key of removed) record(key, { type: `delete`, key }, seq);
+        return ++clock;
       };
 
       const endLoad = () => {
         if (--loadsInFlight === 0) observed.clear();
       };
 
-      const newerEvent = (key: string, since: number) => {
-        const latest = observed.get(key);
-        return latest && latest.seq > since ? latest.event : undefined;
+      /** Writes what a load returned, after `begin()`, and records it against older loads and buffered events. */
+      const writeLoad = (records: Map<string, TItem>, removed: Array<string>, start: number) => {
+        for (const key of removed) removeOne(key);
+        upsertAll(Array.from(records.values()));
+        for (const [key, item] of records) {
+          if (loadsInFlight > 1) record(key, { type: `upsert`, item }, start);
+          const buffered = pending.get(key);
+          if (buffered && buffered.seq < start) pending.set(key, { seq: buffered.seq, event: { type: `upsert`, item } });
+        }
+        for (const key of removed) {
+          if (loadsInFlight > 1) record(key, { type: `delete`, key }, start);
+          const buffered = pending.get(key);
+          if (buffered && buffered.seq < start) {
+            const unsynced = buffered.event.type === `upsert` ? buffered.event.item : buffered.event.unsynced;
+            pending.set(key, { seq: buffered.seq, event: unsynced ? { type: `delete`, key, unsynced } : { type: `delete`, key } });
+          }
+        }
       };
 
-      const reconcile = (lists: Array<Array<RecordModel>>, since: number) => {
+      const newerEvent = (key: string, start: number) => {
+        const latest = observed.get(key);
+        return latest && latest.seq > start ? latest.event : undefined;
+      };
+
+      const reconcile = (lists: Array<Array<RecordModel>>, start: number) => {
         const records = new Map<string, TItem>();
         for (const list of lists) {
           for (const record of list) {
             const item = toItem(record);
             const key = getKey(item);
-            const latest = newerEvent(key, since);
+            const latest = newerEvent(key, start);
             if (latest?.type === `delete`) continue;
             records.set(key, latest?.type === `upsert` ? latest.item : item);
           }
@@ -307,36 +321,35 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
         });
       };
 
+      /** For each subset, the start of the latest refetch that committed it: a load of the subset started before returns a superseded snapshot. */
+      const refreshedBy = new WeakMap<LoadSubsetOptions, number>();
+      const superseded = (subset: LoadSubsetOptions, start: number) => (refreshedBy.get(subset) ?? 0) > start;
+      /** A subset still owned by a live query; a released or aborted one must not install rows any more. */
+      const isCurrent = (subset: LoadSubsetOptions) => activeSubsets.has(subset) && !subset.signal?.aborted;
+
       /**
        * Reloads the subsets of the active live queries and replaces the synced state with them in one commit: rows
-       * synced before the refetch that no subset returns are deleted. Truncating instead would make TanStack DB
-       * replay every subscription, and an ordered one replays as a full-source load of the whole collection.
+       * synced before the refetch that no current subset returns are deleted. Truncating instead would make TanStack
+       * DB replay every subscription, and an ordered one replays as a full-source load of the whole collection.
        */
-      let loadOrdinal = 0;
-      /** For each subset, the ordinal of the latest refetch that committed it: an older load of the subset returns a superseded snapshot. */
-      const refreshedBy = new WeakMap<LoadSubsetOptions, number>();
-      const superseded = (subset: LoadSubsetOptions, ordinal: number) => (refreshedBy.get(subset) ?? -1) > ordinal;
-
       const refetchSubsets = async () => {
-        const since = startLoad();
-        const ordinal = ++loadOrdinal;
+        const start = startLoad();
         try {
           const before = new Set(syncedKeys);
-          const subsets = Array.from(activeSubsets.keys()).filter((subset) => !subset.signal?.aborted);
+          const subsets = Array.from(activeSubsets.keys()).filter(isCurrent);
           const results = await mapConcurrently(subsets, (subset) => fetchSubset(subset, undefined));
           if (!active) return;
-          const current = subsets.flatMap((subset, i) => (superseded(subset, ordinal) ? [] : [{ subset, lists: results[i] as Array<Array<RecordModel>> }]));
+          const current = subsets.flatMap((subset, i) => (isCurrent(subset) && !superseded(subset, start) ? [{ subset, lists: results[i] as Array<Array<RecordModel>> }] : []));
           const records = reconcile(
             current.flatMap(({ lists }) => lists),
-            since,
+            start,
           );
-          // A newer refetch already replaced the state of a superseded subset, so only it may decide what to remove
-          const removed = current.length < subsets.length ? [] : Array.from(before).filter((key) => syncedKeys.has(key) && !records.has(key) && !newerEvent(key, since));
+          // A newer refetch already replaced the rows of a superseded subset, so only it may decide what to remove
+          const anySuperseded = subsets.some((subset) => superseded(subset, start));
+          const removed = anySuperseded ? [] : Array.from(before).filter((key) => syncedKeys.has(key) && !records.has(key) && !newerEvent(key, start));
           begin();
-          for (const key of removed) removeOne(key);
-          upsertAll(Array.from(records.values()));
-          recordLoad(records, removed, since);
-          for (const { subset } of current) refreshedBy.set(subset, ordinal);
+          writeLoad(records, removed, start);
+          for (const { subset } of current) refreshedBy.set(subset, start);
           await commit();
         } finally {
           endLoad();
@@ -344,17 +357,14 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
       };
 
       const session: SyncSession<TItem> = {
-        enqueue: (event) => {
-          observe(event);
-          enqueue(event);
-        },
+        enqueue: (event) => enqueue(event, observe(event)),
         refetch: async () => {
           if (onDemand) {
             if (active) await refetchSubsets();
             return;
           }
           const generation = ++refetchGeneration;
-          const sequenceAtStart = sequence;
+          const sequenceAtStart = clock;
           newestRefetchPending = true;
           cancelFlush();
           const settle = () => {
@@ -393,16 +403,15 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
               case `create`:
               case `update`: {
                 const upsert: SyncEvent<TItem> = { type: `upsert`, item: toItem(event.record) };
-                observe(upsert);
+                const stamp = observe(upsert);
                 if (!filterRealtime || isLoaded(upsert.item)) {
-                  enqueue(upsert);
+                  enqueue(upsert, stamp);
                 }
                 break;
               }
               case `delete`: {
                 const removal: SyncEvent<TItem> = { type: `delete`, key: event.record.id };
-                observe(removal);
-                enqueue(removal);
+                enqueue(removal, observe(removal));
                 break;
               }
             }
@@ -453,16 +462,14 @@ export function pocketbaseCollectionOptions<TItem extends PocketbaseRecord = Poc
           return Promise.resolve();
         }
         activeSubsets.set(subset, filterRealtime ? predicateFor(subset.where) : matchAll);
-        const since = startLoad();
-        const ordinal = ++loadOrdinal;
+        const start = startLoad();
         return fetchSubset(subset, subset.signal)
           .then(
             async (lists) => {
-              if (!active || subset.signal?.aborted || superseded(subset, ordinal)) return;
-              const records = reconcile(lists, since);
+              if (!active || !isCurrent(subset) || superseded(subset, start)) return;
+              const records = reconcile(lists, start);
               begin();
-              upsertAll(Array.from(records.values()));
-              recordLoad(records, [], since);
+              writeLoad(records, [], start);
               // The load settles once its rows are visible, as the LoadSubsetFn contract requires
               await commit();
             },

@@ -1,7 +1,7 @@
 import { describe, expect, it, jest, mock } from 'bun:test';
 import { BasicIndex, createCollection, createLiveQueryCollection, eq } from '@tanstack/db';
 import type { RecordService, RecordSubscription } from 'pocketbase';
-import { buildSubsetRequest, compileSort, compileWhere, pocketbaseCollectionOptions, UnsupportedFilterError } from '../src';
+import { buildSubsetRequest, compileSort, compileWhere, type PocketbaseCollectionUtils, pocketbaseCollectionOptions, UnsupportedFilterError } from '../src';
 
 type Row = { id: string; data: string; updated?: string; created?: string };
 
@@ -701,15 +701,29 @@ describe(`loadSubset requests`, () => {
   function startOnDemand(svc: FakeRecordService, extra: Record<string, unknown> = {}) {
     const options = pocketbaseCollectionOptions({ recordService: svc as unknown as RecordService<Row>, syncMode: `on-demand`, ...extra });
     const collection = { config: { syncMode: `on-demand` } };
-    const sync = { begin: mock(() => {}), write: mock((_message: { type: string; value?: Row }) => {}), commit: mock(() => true as never), truncate: mock(() => {}) };
+    const sync = { begin: mock(() => {}), write: mock((_message: WriteMessage) => {}), commit: mock(() => true as never), truncate: mock(() => {}) };
     const result = options.sync.sync({
       collection: collection as never,
       ...sync,
       markReady: mock(() => {}),
       markError: mock(() => {}),
     });
-    return { ...(result as { loadSubset: (subset: Record<string, unknown>) => true | Promise<void>; cleanup: () => void }), sync };
+    type Subset = Record<string, unknown>;
+    return { ...(result as { loadSubset: (subset: Subset) => true | Promise<void>; unloadSubset: (subset: Subset) => void; cleanup: () => void }), sync, refetch: (options.utils as PocketbaseCollectionUtils).refetch };
   }
+
+  type WriteMessage = { type: string; value?: Row; key?: string };
+  const whereData = (value: string) => ({
+    where: {
+      type: `func`,
+      name: `eq`,
+      args: [
+        { type: `ref`, path: [`data`] },
+        { type: `val`, value },
+      ],
+    },
+  });
+  const writesOf = (write: { mock: { calls: Array<[WriteMessage]> } }, key: string) => write.mock.calls.map(([message]) => message).filter((message) => (message.value?.id ?? message.key) === key);
 
   it(`skips the request when the signal is already aborted`, async () => {
     const svc = service();
@@ -843,6 +857,51 @@ describe(`loadSubset requests`, () => {
     expect(sync.begin).toHaveBeenCalledTimes(1);
     expect(sync.commit).toHaveBeenCalledTimes(1);
     expect(sync.write.mock.calls.map(([message]) => message.value?.id).sort()).toEqual(ids.slice(0, 250));
+    cleanup();
+  });
+
+  it(`does not let an earlier load's commit override a later load's response`, async () => {
+    const svc = service();
+    const [older, newer] = [Promise.withResolvers<Array<Row>>(), Promise.withResolvers<Array<Row>>()];
+    svc.getFullList.mockImplementationOnce(() => older.promise).mockImplementationOnce(() => newer.promise);
+    const { loadSubset, cleanup, sync } = startOnDemand(svc);
+
+    const first = loadSubset(whereData(`open`));
+    const second = loadSubset({});
+    older.resolve([{ id: `a`, data: `open`, updated: `1` }]);
+    await first;
+    newer.resolve([{ id: `a`, data: `open`, updated: `2` }]);
+    await second;
+
+    expect(writesOf(sync.write, `a`).at(-1)?.value?.updated).toBe(`2`);
+    cleanup();
+  });
+
+  it(`does not restore the rows of a subset released while an older refetch was in flight`, async () => {
+    const svc = service();
+    svc.records.set(`a1`, { id: `a1`, data: `a` });
+    svc.records.set(`b1`, { id: `b1`, data: `b` });
+    const { loadSubset, unloadSubset, cleanup, sync, refetch } = startOnDemand(svc);
+    const [subsetA, subsetB] = [whereData(`a`), whereData(`b`)];
+    await loadSubset(subsetA);
+    await loadSubset(subsetB);
+
+    const [slowA, slowB] = [Promise.withResolvers<Array<Row>>(), Promise.withResolvers<Array<Row>>()];
+    svc.getFullList.mockImplementationOnce(() => slowA.promise).mockImplementationOnce(() => slowB.promise);
+    const olderRefetch = refetch();
+    unloadSubset(subsetB);
+    await refetch();
+    expect(writesOf(sync.write, `b1`).at(-1)?.type).toBe(`delete`);
+
+    // A row created on the server for the released subset must not be installed either
+    slowA.resolve([{ id: `a1`, data: `a` }]);
+    slowB.resolve([
+      { id: `b1`, data: `b` },
+      { id: `b2`, data: `b` },
+    ]);
+    await olderRefetch;
+    expect(writesOf(sync.write, `b1`).at(-1)?.type).toBe(`delete`);
+    expect(writesOf(sync.write, `b2`)).toEqual([]);
     cleanup();
   });
 });
@@ -1038,5 +1097,19 @@ describe(`on-demand live queries`, () => {
     svc.emit(`create`, { id: `late`, data: `open` });
     await tick();
     expect(rows.get(`late`)).toBeUndefined();
+  });
+
+  it(`does not let an event buffered before a load restore its older value after the load commits`, async () => {
+    const svc = service();
+    svc.records.set(`a`, { id: `a`, data: `open`, updated: `2` });
+    const rows = onDemand(svc, { batchDelay: 30 });
+    await rows.stateWhenReady();
+    svc.emit(`update`, { id: `a`, data: `open`, updated: `1` });
+
+    const open = createLiveQueryCollection((q) => q.from({ row: rows }).where(({ row }) => eq(row.data, `open`)));
+    await open.preload();
+    await sleep(60);
+
+    expect(rows.get(`a`)?.updated).toBe(`2`);
   });
 });
