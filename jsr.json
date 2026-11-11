@@ -13,7 +13,6 @@
       "tests",
       "*.config.*",
       "*.md",
-      "CLAUDE.md",
       "lefthook.yml",
       "bun.lockb"
     ]
